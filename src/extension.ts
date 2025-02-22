@@ -492,8 +492,28 @@ class FileViewProvider implements vscode.WebviewViewProvider {
         webviewView.webview.onDidReceiveMessage(async message => {
             switch (message.type) {
                 case 'openFile':
-                    const document = await vscode.workspace.openTextDocument(message.path);
-                    await vscode.window.showTextDocument(document);
+                    try {
+                        // Ensure the file path is within the workspace
+                        if (!vscode.workspace.workspaceFolders) {
+                            throw new Error('No workspace folder is open');
+                        }
+                        const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
+                        const fullPath = path.join(workspaceRoot, message.path);
+                        
+                        // Check if file exists before trying to open it
+                        if (!fs.existsSync(fullPath)) {
+                            throw new Error(`File does not exist: ${message.path}`);
+                        }
+                        
+                        // Create VS Code URI for the file
+                        const fileUri = vscode.Uri.file(fullPath);
+                        
+                        // Try to open the document
+                        const document = await vscode.workspace.openTextDocument(fileUri);
+                        await vscode.window.showTextDocument(document);
+                    } catch (error) {
+                        vscode.window.showErrorMessage(`Failed to open file: ${error instanceof Error ? error.message : 'Unknown error'}`);
+                    }
                     break;
                 case 'toggleFileContext':
                     try {
@@ -699,6 +719,22 @@ class FileViewProvider implements vscode.WebviewViewProvider {
                         background-color: #ff8c0033;
                         color: #ff8c00;
                     }
+                    .file.selected {
+                        background-color: var(--vscode-list-activeSelectionBackground);
+                        color: var(--vscode-list-activeSelectionForeground);
+                    }
+                    .file.selected .context-indicator.included {
+                        background-color: var(--vscode-list-activeSelectionForeground);
+                    }
+                    .file.selected .context-indicator.excluded {
+                        background-color: var(--vscode-list-activeSelectionForeground);
+                        opacity: 0.7;
+                    }
+                    .file.selected .action-button {
+                        opacity: 1;
+                        background-color: var(--vscode-list-activeSelectionBackground);
+                        color: var(--vscode-list-activeSelectionForeground);
+                    }
                 </style>
             </head>
             <body>
@@ -840,7 +876,16 @@ class FileViewProvider implements vscode.WebviewViewProvider {
                                 fileDiv.appendChild(indicator);
                                 fileDiv.appendChild(actionsDiv);
                                 
+                                // Change single click to just select the file
                                 fileDiv.addEventListener('click', () => {
+                                    // Remove selected class from all files
+                                    document.querySelectorAll('.file').forEach(f => f.classList.remove('selected'));
+                                    // Add selected class to this file
+                                    fileDiv.classList.add('selected');
+                                });
+
+                                // Add double click to open file
+                                fileDiv.addEventListener('dblclick', () => {
                                     vscode.postMessage({
                                         type: 'openFile',
                                         path: file.path

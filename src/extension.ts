@@ -126,34 +126,66 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
 
     private async executeCommandWithRetry(command: string, retryCount = 0): Promise<boolean> {
         try {
-            const terminalId = `Falalo-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-            const terminal = vscode.window.createTerminal({
-                name: terminalId,
-                shellPath: process.platform === 'win32' ? 'cmd.exe' : '/bin/bash'
+            return new Promise<boolean>((resolve) => {
+                const terminalId = `Falalo-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+                const terminal = vscode.window.createTerminal({
+                    name: terminalId,
+                    shellPath: process.platform === 'win32' ? 'cmd.exe' : '/bin/bash'
+                });
+
+                this.activeTerminals.set(terminalId, terminal);
+
+                // Clean up terminal and check exit code when it closes
+                const disposable = vscode.window.onDidCloseTerminal(async closedTerminal => {
+                    if (closedTerminal === terminal) {
+                        disposable.dispose();
+                        this.activeTerminals.delete(terminalId);
+                        try {
+                            // Read the captured exit code
+                            const fs = require('fs');
+                            const capturedExitCode = await fs.promises.readFile(`/tmp/${terminalId}_exit_code`, 'utf8');
+                            const actualExitCode = parseInt(capturedExitCode.trim(), 10);
+                            const output = await fs.promises.readFile(`/tmp/${terminalId}_output`, 'utf8');
+
+                            if (actualExitCode !== 0) {
+                                if (retryCount < this.maxRetries - 1) {
+                                    this.addMessageToChat('assistant', `⚠️ Command failed with exit code ${actualExitCode}, retrying (attempt ${retryCount + 2}/${this.maxRetries})...`);
+                                    await new Promise(resolve => setTimeout(resolve, 2000));
+                                    const success = await this.executeCommandWithRetry(command, retryCount + 1);
+                                    resolve(success);
+                                } else {
+                                    this.addMessageToChat('assistant', `❌ Command failed after ${this.maxRetries} attempts. Skipping to next step.`);
+                                    resolve(false);
+                                }
+                            } else {
+                                this.terminalOutput = `${this.terminalOutput}\n$ ${command} (Terminal: ${terminalId})\n${output}\nExit code: ${actualExitCode}\n`;
+                                this.addMessageToChat('assistant', `✅ Command executed successfully in terminal ${terminalId}`);
+                                resolve(true);
+                            }
+                        } catch (error) {
+                            if (retryCount < this.maxRetries - 1) {
+                                this.addMessageToChat('assistant', `⚠️ Command failed, retrying (attempt ${retryCount + 2}/${this.maxRetries})...`);
+                                await new Promise(resolve => setTimeout(resolve, 2000));
+                                const success = await this.executeCommandWithRetry(command, retryCount + 1);
+                                resolve(success);
+                            } else {
+                                this.addMessageToChat('assistant', `❌ Command failed after ${this.maxRetries} attempts. Skipping to next step.`);
+                                resolve(false);
+                            }
+                        }
+                    }
+                });
+
+                terminal.show(true); // true means preserve focus
+                // Wrap the command to capture its output and exit code
+                const wrappedCommand = process.platform === 'win32' 
+                    ? `${command} > %TEMP%\\${terminalId}_output 2>&1 & echo %ERRORLEVEL% > %TEMP%\\${terminalId}_exit_code & exit`
+                    : `${command} 2>&1 | tee /tmp/${terminalId}_output; echo $? > /tmp/${terminalId}_exit_code; exit`;
+                terminal.sendText(wrappedCommand);
+
+                // Log the command start
+                this.addMessageToChat('assistant', `🚀 Started command in terminal ${terminalId}: ${command}`);
             });
-
-            this.activeTerminals.set(terminalId, terminal);
-
-            // Clean up terminal when it closes
-            const disposable = vscode.window.onDidCloseTerminal(closedTerminal => {
-                if (closedTerminal === terminal) {
-                    disposable.dispose();
-                    this.activeTerminals.delete(terminalId);
-                }
-            });
-
-            terminal.show(true); // true means preserve focus
-            // Wrap the command to capture its output and exit code
-            const wrappedCommand = process.platform === 'win32' 
-                ? `${command} > %TEMP%\\${terminalId}_output 2>&1 & echo %ERRORLEVEL% > %TEMP%\\${terminalId}_exit_code`
-                : `${command} 2>&1 | tee /tmp/${terminalId}_output; echo $? > /tmp/${terminalId}_exit_code`;
-            terminal.sendText(wrappedCommand);
-
-            // Log the command execution
-            this.terminalOutput = `${this.terminalOutput}\n$ ${command} (Terminal: ${terminalId})\n`;
-            this.addMessageToChat('assistant', `🚀 Started command in terminal ${terminalId}: ${command}`);
-
-            return true; // Return immediately without waiting
         } catch (error) {
             if (retryCount < this.maxRetries - 1) {
                 this.addMessageToChat('assistant', `⚠️ Command failed to start, retrying (attempt ${retryCount + 2}/${this.maxRetries})...`);
@@ -308,12 +340,22 @@ Workspace context:${contextInfo}`;
                     const commands = [...implementation.matchAll(commandRegex)].map(match => match[1]);
                     
                     if (commands.length > 0) {
-                        this.addMessageToChat('assistant', '⚡ Executing commands in parallel after successful file creation:');
-                        // Execute all commands in parallel
-                        await Promise.all(commands.map(command => {
+                        this.addMessageToChat('assistant', '⚡ Executing commands after successful file creation:');
+                        // Execute commands in parallel within the same step
+                        const results = await Promise.all(commands.map(async command => {
                             this.addMessageToChat('assistant', `📝 Starting: ${command}`);
-                            return this.executeCommandWithRetry(command);
+                            return {
+                                command,
+                                success: await this.executeCommandWithRetry(command)
+                            };
                         }));
+
+                        // Check if any command failed
+                        if (results.some(r => !r.success)) {
+                            const failedCommands = results.filter(r => !r.success).map(r => r.command);
+                            this.addMessageToChat('assistant', `⚠️ Some commands failed: ${failedCommands.join(', ')}`);
+                            continue; // Skip to next step if any command failed
+                        }
                     }
                 }
 

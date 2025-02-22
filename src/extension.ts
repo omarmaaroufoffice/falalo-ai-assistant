@@ -74,332 +74,11 @@ class ContextManager {
     }
 }
 
-interface EditBlock {
-    type: 'replace' | 'add' | 'delete' | 'rewrite';
-    file: string;
-    description: string;
-    content: string;
-    startLine?: number;
-    endLine?: number;
-}
-
-class EditManager {
-    private static readonly EDIT_MARKERS = {
-        REPLACE_BLOCK: '#replace-block#',
-        ADD_BLOCK: '#add-block#',
-        DELETE_BLOCK: '#delete-block#',
-        REWRITE_FILE: '#rewrite-file#',
-        END_BLOCK: '#end-block#'
-    };
-
-    private static validateEditBlock(edit: EditBlock): string[] {
-        const errors: string[] = [];
-        
-        // Common validations
-        if (!edit.file) {
-            errors.push('File path is required');
-            return errors;
-        }
-        if (!edit.type) {
-            errors.push('Edit type is required');
-            return errors;
-        }
-        if (!edit.description) {
-            errors.push('Description is required');
-            return errors;
-        }
-
-        // Type-specific validations
-        switch (edit.type) {
-            case 'replace':
-                if (typeof edit.startLine !== 'number') errors.push('Start line is required for replace blocks');
-                if (typeof edit.endLine !== 'number') errors.push('End line is required for replace blocks');
-                if (typeof edit.content !== 'string') errors.push('Content is required for replace blocks');
-                if (typeof edit.startLine === 'number' && typeof edit.endLine === 'number' && edit.startLine > edit.endLine) {
-                    errors.push(`Invalid line range: ${edit.startLine}-${edit.endLine} (start line must be <= end line)`);
-                }
-                break;
-            case 'add':
-                if (typeof edit.startLine !== 'number') errors.push('Line number is required for add blocks');
-                if (typeof edit.content !== 'string') errors.push('Content is required for add blocks');
-                break;
-            case 'delete':
-                if (typeof edit.startLine !== 'number') errors.push('Start line is required for delete blocks');
-                if (typeof edit.endLine !== 'number') errors.push('End line is required for delete blocks');
-                if (typeof edit.startLine === 'number' && typeof edit.endLine === 'number' && edit.startLine > edit.endLine) {
-                    errors.push(`Invalid line range: ${edit.startLine}-${edit.endLine} (start line must be <= end line)`);
-                }
-                break;
-            case 'rewrite':
-                if (typeof edit.content !== 'string') errors.push('Content is required for rewrite blocks');
-                break;
-            default:
-                errors.push(`Invalid edit type: ${edit.type}`);
-        }
-
-        return errors;
-    }
-
-    private static parseEditBlocks(text: string): EditBlock[] {
-        const blocks: EditBlock[] = [];
-        const lines = text.split('\n');
-        let currentBlock: Partial<EditBlock> | null = null;
-
-        for (let i = 0; i < lines.length; i++) {
-            const line = lines[i].trim();
-
-            // Check for block start markers
-            if (line.startsWith(this.EDIT_MARKERS.REPLACE_BLOCK) ||
-                line.startsWith(this.EDIT_MARKERS.ADD_BLOCK) ||
-                line.startsWith(this.EDIT_MARKERS.DELETE_BLOCK) ||
-                line.startsWith(this.EDIT_MARKERS.REWRITE_FILE)) {
-                
-                // Parse the edit instruction
-                const instruction = line.split('|').map(part => part.trim());
-                if (instruction.length < 3) {
-                    vscode.window.showErrorMessage(`Invalid edit block format at line ${i + 1}. Expected format: #marker#|file_path|description|[line_numbers]`);
-                    continue;
-                }
-
-                const marker = instruction[0];
-                const file = instruction[1];
-                const description = instruction[2];
-                
-                currentBlock = {
-                    type: marker === this.EDIT_MARKERS.REPLACE_BLOCK ? 'replace' :
-                          marker === this.EDIT_MARKERS.ADD_BLOCK ? 'add' :
-                          marker === this.EDIT_MARKERS.DELETE_BLOCK ? 'delete' : 'rewrite',
-                    file,
-                    description,
-                    content: ''
-                } as EditBlock;
-
-                // Parse line numbers for replace, add, and delete operations
-                if (currentBlock.type !== 'rewrite' && instruction.length > 3) {
-                    const lineRange = instruction[3].split('-').map(num => {
-                        const parsed = parseInt(num, 10);
-                        return isNaN(parsed) ? undefined : parsed;
-                    });
-                    
-                    if (lineRange.some(num => num === undefined)) {
-                        vscode.window.showErrorMessage(`Invalid line numbers at line ${i + 1}: ${instruction[3]}`);
-                        continue;
-                    }
-
-                    currentBlock.startLine = lineRange[0]!;
-                    currentBlock.endLine = lineRange[1] || lineRange[0]!;
-                }
-
-                continue;
-            }
-
-            // Check for block end
-            if (line === this.EDIT_MARKERS.END_BLOCK && currentBlock) {
-                if (currentBlock.content?.trim()) {
-                    currentBlock.content = currentBlock.content.trim();
-                    blocks.push(currentBlock as EditBlock);
-                } else {
-                    vscode.window.showWarningMessage(`Empty content block for ${currentBlock.file}`);
-                }
-                currentBlock = null;
-                continue;
-            }
-
-            // Accumulate content if we're in a block
-            if (currentBlock) {
-                currentBlock.content = (currentBlock.content || '') + line + '\n';
-            }
-        }
-
-        // Check for unclosed blocks
-        if (currentBlock) {
-            vscode.window.showErrorMessage(`Unclosed edit block for ${currentBlock.file}. Missing ${this.EDIT_MARKERS.END_BLOCK}`);
-        }
-
-        return blocks;
-    }
-
-    public static async processEditMarkers(text: string): Promise<{ success: boolean; errors: string[] }> {
-        const editBlocks = this.parseEditBlocks(text);
-        const errors: string[] = [];
-        
-        for (const edit of editBlocks) {
-            try {
-                // Validate edit block parameters
-                const validationErrors = this.validateEditBlock(edit);
-                if (validationErrors.length > 0) {
-                    throw new Error(`Invalid edit block for ${edit.file || 'unknown file'}:\n${validationErrors.join('\n')}`);
-                }
-
-                // Check if file exists and create if necessary
-                if (!vscode.workspace.workspaceFolders) {
-                    throw new Error('No workspace folder is open');
-                }
-                const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
-                const filePath = path.join(workspaceRoot, edit.file);
-
-                // Create parent directories if they don't exist
-                await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
-
-                // For non-rewrite operations, create the file if it doesn't exist
-                if (!fs.existsSync(filePath) && edit.type !== 'rewrite') {
-                    await fs.promises.writeFile(filePath, '');
-                    vscode.window.showInformationMessage(`Created new file: ${edit.file}`);
-                }
-
-                // Process the edit based on type
-                switch (edit.type) {
-                    case 'replace':
-                        await this.handleReplaceBlock(edit as EditBlock & { type: 'replace' });
-                        break;
-                    case 'add':
-                        await this.handleAddBlock(edit as EditBlock & { type: 'add' });
-                        break;
-                    case 'delete':
-                        await this.handleDeleteBlock(edit as EditBlock & { type: 'delete' });
-                        break;
-                    case 'rewrite':
-                        await this.handleRewriteFile(edit as EditBlock & { type: 'rewrite' });
-                        break;
-                }
-            } catch (error) {
-                const errorMessage = `Failed to apply edit to ${edit.file || 'unknown file'}: ${error instanceof Error ? error.message : 'Unknown error'}`;
-                vscode.window.showErrorMessage(errorMessage);
-                errors.push(errorMessage);
-            }
-        }
-
-        return {
-            success: errors.length === 0,
-            errors
-        };
-    }
-
-    private static async handleReplaceBlock(edit: EditBlock & { type: 'replace' }): Promise<void> {
-        if (!vscode.workspace.workspaceFolders) {
-            throw new Error('No workspace folder is open');
-        }
-
-        const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
-        const filePath = path.join(workspaceRoot, edit.file);
-
-        // Read the file content
-        const fileContent = await fs.promises.readFile(filePath, 'utf8');
-        const lines = fileContent.split('\n');
-
-        // Validate line numbers
-        if (!edit.startLine || edit.startLine < 1) {
-            throw new Error(`Invalid start line: ${edit.startLine} (must be >= 1)`);
-        }
-        if (!edit.endLine || edit.endLine > lines.length) {
-            // If end line is beyond file length, adjust it
-            edit.endLine = lines.length;
-            vscode.window.showWarningMessage(`Adjusted end line to file length (${lines.length}) for ${edit.file}`);
-        }
-
-        // Replace the specified lines
-        const newContent = [
-            ...lines.slice(0, edit.startLine - 1),
-            ...edit.content.trim().split('\n'),
-            ...lines.slice(edit.endLine)
-        ].join('\n');
-
-        // Write the file
-        await fs.promises.writeFile(filePath, newContent);
-        
-        // Show success message
-        vscode.window.showInformationMessage(`Replaced lines ${edit.startLine}-${edit.endLine} in ${edit.file}: ${edit.description}`);
-    }
-
-    private static async handleAddBlock(edit: EditBlock & { type: 'add' }): Promise<void> {
-        if (!vscode.workspace.workspaceFolders) {
-            throw new Error('No workspace folder is open');
-        }
-
-        const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
-        const filePath = path.join(workspaceRoot, edit.file);
-
-        // Read the file content
-        const fileContent = await fs.promises.readFile(filePath, 'utf8');
-        const lines = fileContent.split('\n');
-
-        // Validate line number
-        if (!edit.startLine || edit.startLine < 1) {
-            throw new Error(`Invalid line number: ${edit.startLine} (must be >= 1)`);
-        }
-        if (edit.startLine > lines.length + 1) {
-            // If start line is beyond file length, adjust it
-            edit.startLine = lines.length + 1;
-            vscode.window.showWarningMessage(`Adjusted insertion point to end of file (${lines.length + 1}) for ${edit.file}`);
-        }
-
-        // Add the new content
-        const newContent = [
-            ...lines.slice(0, edit.startLine - 1),
-            edit.content.trim(),
-            ...lines.slice(edit.startLine - 1)
-        ].join('\n');
-
-        // Write the file
-        await fs.promises.writeFile(filePath, newContent);
-        
-        // Show success message
-        vscode.window.showInformationMessage(`Added content at line ${edit.startLine} in ${edit.file}: ${edit.description}`);
-    }
-
-    private static async handleDeleteBlock(edit: EditBlock & { type: 'delete' }): Promise<void> {
-        if (!vscode.workspace.workspaceFolders) {
-            throw new Error('No workspace folder is open');
-        }
-
-        const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
-        const filePath = path.join(workspaceRoot, edit.file);
-
-        // Read the file content
-        const fileContent = await fs.promises.readFile(filePath, 'utf8');
-        const lines = fileContent.split('\n');
-
-        // Validate line numbers
-        if (!edit.startLine || !edit.endLine || edit.startLine < 1 || edit.endLine > lines.length) {
-            throw new Error(`Invalid line range: ${edit.startLine}-${edit.endLine}`);
-        }
-
-        // Remove the specified lines
-        const newContent = [
-            ...lines.slice(0, edit.startLine - 1),
-            ...lines.slice(edit.endLine)
-        ].join('\n');
-
-        // Write the file
-        await fs.promises.writeFile(filePath, newContent);
-        
-        // Show success message
-        vscode.window.showInformationMessage(`Deleted lines ${edit.startLine}-${edit.endLine} from ${edit.file}: ${edit.description}`);
-    }
-
-    private static async handleRewriteFile(edit: EditBlock & { type: 'rewrite' }): Promise<void> {
-        if (!vscode.workspace.workspaceFolders) {
-            throw new Error('No workspace folder is open');
-        }
-
-        const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
-        const filePath = path.join(workspaceRoot, edit.file);
-
-        // Create directory if it doesn't exist
-        await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
-
-        // Write the new content
-        await fs.promises.writeFile(filePath, edit.content.trim());
-        
-        // Show success message
-        vscode.window.showInformationMessage(`Rewritten file ${edit.file}: ${edit.description}`);
-    }
-}
-
 class ChatViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'falaloChat';
     private _view?: vscode.WebviewView;
     private genAI: GoogleGenerativeAI;
+    private fileViewProvider?: FileViewProvider;
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -409,6 +88,10 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
         const config = vscode.workspace.getConfiguration('falalo');
         const apiKey = config.get('googleApiKey', '');
         this.genAI = new GoogleGenerativeAI(apiKey);
+    }
+
+    public setFileViewProvider(provider: FileViewProvider) {
+        this.fileViewProvider = provider;
     }
 
     public resolveWebviewView(
@@ -439,8 +122,8 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     private async handleUserMessage(text: string) {
         try {
             if (!this._view) {
-                return;
-            }
+            return;
+        }
 
             // Add user message to chat
             this.addMessageToChat('user', text);
@@ -467,28 +150,6 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
 5. Format your response as a numbered list
 6. Be specific about file operations, code changes, or other actions needed
 
-When editing files, use these special markers:
-1. Replace a block of code:
-   #replace-block#|file_path|description|start_line-end_line
-   new code here
-   #end-block#
-
-2. Add new code:
-   #add-block#|file_path|description|line_number
-   code to add
-   #end-block#
-
-3. Delete code:
-   #delete-block#|file_path|description|start_line-end_line
-   #end-block#
-
-4. Rewrite entire file:
-   #rewrite-file#|file_path|description
-   new file content
-   #end-block#
-
-Note: If a file doesn't exist, it will be created automatically. Line numbers will be adjusted if they're out of range.
-
 You have the following context about the workspace:${contextInfo}
 
 Please analyze this request and provide a step-by-step plan:
@@ -504,93 +165,37 @@ ${text}`;
 
             // Stage 2: Execution Phase
             const steps = plan.split('\n').filter(line => /^\d+\./.test(line));
-            let hasErrors = false;
             
             for (const step of steps) {
-                let retryCount = 0;
-                let success = false;
-                let lastErrors: string[] = [];
-
-                while (!success && retryCount < 4) {
-                    // Prepare execution instructions for each step
-                    let executionInstructions = `You are an execution AI. Your role is to implement the following step:
+                // Prepare execution instructions for each step
+                const executionInstructions = `You are an execution AI. Your role is to implement the following step:
 
 ${step}
 
-When editing files, use these special markers:
-1. Replace a block of code:
-   #replace-block#|file_path|description|start_line-end_line
-   new code here
-   #end-block#
+When creating files, follow these rules exactly:
+1. Start with "###" followed by the filename on its own line
+2. Put the EXACT file content on the next line(s) WITHOUT any markdown formatting
+3. End with "%%%" on its own line
+4. Leave one blank line between multiple files
 
-2. Add new code:
-   #add-block#|file_path|description|line_number
-   code to add
-   #end-block#
+You have the following context about the workspace:${contextInfo}
 
-3. Delete code:
-   #delete-block#|file_path|description|start_line-end_line
-   #end-block#
+Please implement this step now.`;
 
-4. Rewrite entire file:
-   #rewrite-file#|file_path|description
-   new file content
-   #end-block#
+                // Get implementation from AI
+                const executionModel = this.genAI.getGenerativeModel({ model: 'gemini-pro' });
+                const executionResult = await executionModel.generateContent(executionInstructions);
+                const implementation = executionResult.response.text();
+                
+                // Show the implementation
+                this.addMessageToChat('assistant', `📝 Executing Step: ${step}\n\n${implementation}`);
 
-Note: If a file doesn't exist, it will be created automatically. Line numbers will be adjusted if they're out of range.`;
-
-                    // Add error feedback for retries
-                    if (retryCount > 0) {
-                        executionInstructions += `\n\nPrevious attempt failed with these errors:
-${lastErrors.map(err => `- ${err}`).join('\n')}
-
-Please adjust your implementation to fix these issues.`;
-                    }
-
-                    executionInstructions += `\n\nYou have the following context about the workspace:${contextInfo}\n\nPlease implement this step now.`;
-
-                    // Get implementation from AI
-                    const executionModel = this.genAI.getGenerativeModel({ model: 'gemini-pro' });
-                    const executionResult = await executionModel.generateContent(executionInstructions);
-                    const implementation = executionResult.response.text();
-                    
-                    // Show the implementation
-                    if (retryCount === 0) {
-                        this.addMessageToChat('assistant', `📝 Executing Step: ${step}\n\n${implementation}`);
-                    } else {
-                        this.addMessageToChat('assistant', `🔄 Retry #${retryCount} for Step: ${step}\n\n${implementation}`);
-                    }
-
-                    // Process any file creation markers in the implementation
-                    await this.processFileCreationMarkers(implementation);
-
-                    // Process any edit markers in the implementation and collect errors
-                    const editResult = await EditManager.processEditMarkers(implementation);
-                    if (!editResult.success) {
-                        hasErrors = true;
-                        lastErrors = editResult.errors;
-                        retryCount++;
-                        
-                        if (retryCount < 4) {
-                            this.addMessageToChat('assistant', `⚠️ Attempt failed with errors. Retrying (${retryCount}/3):\n${lastErrors.join('\n')}`);
-                        } else {
-                            this.addMessageToChat('assistant', '❌ Maximum retries reached. Errors:\n' + lastErrors.join('\n'));
-                        }
-                    } else {
-                        success = true;
-                        if (retryCount > 0) {
-                            this.addMessageToChat('assistant', '✅ Successfully fixed the errors on retry!');
-                        }
-                    }
-                }
+                // Process any file creation markers in the implementation
+                await this.processFileCreationMarkers(implementation);
             }
 
             // Final completion message
-            if (hasErrors) {
-                this.addMessageToChat('assistant', '⚠️ Task completed with some errors. Please review the messages above.');
-            } else {
-                this.addMessageToChat('assistant', '✅ All steps have been completed successfully!');
-            }
+            this.addMessageToChat('assistant', '✅ All steps have been completed!');
         } catch (error) {
             vscode.window.showErrorMessage(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
             this.addMessageToChat('assistant', '❌ An error occurred while processing your request.');
@@ -631,12 +236,20 @@ Please adjust your implementation to fix these issues.`;
             // Write file content
             await fs.promises.writeFile(fullPath, content);
 
+            // Automatically include the new file in context
+            await this.contextManager.includeFile(filePath);
+
             // Show success message
-            vscode.window.showInformationMessage(`Created file: ${filePath}`);
+            vscode.window.showInformationMessage(`Created and included file: ${filePath}`);
 
             // Open the file in editor
             const document = await vscode.workspace.openTextDocument(fullPath);
             await vscode.window.showTextDocument(document);
+
+            // Update the file tree view to show the new file with blue dot
+            if (this.fileViewProvider) {
+                await this.fileViewProvider.updateFileList();
+            }
         } catch (error) {
             vscode.window.showErrorMessage(`Failed to create file ${filePath}: ${error instanceof Error ? error.message : 'Unknown error'}`);
         }
@@ -1092,7 +705,7 @@ class FileViewProvider implements vscode.WebviewViewProvider {
         });
     }
 
-    private async updateFileList() {
+    public async updateFileList() {
         if (!this._view || !vscode.workspace.workspaceFolders) {
             return;
         }
@@ -1524,6 +1137,9 @@ export function activate(context: vscode.ExtensionContext) {
     const contextManager = new ContextManager();
     const chatViewProvider = new ChatViewProvider(context.extensionUri, context, contextManager);
     const fileViewProvider = new FileViewProvider(context.extensionUri, context, contextManager);
+
+    // Set up the connection between providers
+    chatViewProvider.setFileViewProvider(fileViewProvider);
 
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, chatViewProvider),

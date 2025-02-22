@@ -78,6 +78,8 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     private _view?: vscode.WebviewView;
     private openai: OpenAI;
     private fileViewProvider?: FileViewProvider;
+    private terminalOutput: string = '';
+    private readonly maxRetries: number = 4;
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -121,6 +123,72 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
         });
     }
 
+    private async executeCommandWithRetry(command: string, retryCount = 0): Promise<boolean> {
+        try {
+            return new Promise<boolean>((resolve) => {
+                const terminal = vscode.window.createTerminal({
+                    name: 'Falalo Execution',
+                    shellPath: process.platform === 'win32' ? 'cmd.exe' : '/bin/bash'
+                });
+
+                const disposable = vscode.window.onDidCloseTerminal(async closedTerminal => {
+                    if (closedTerminal === terminal) {
+                        disposable.dispose();
+                        try {
+                            // Read the captured exit code
+                            const fs = require('fs');
+                            const capturedExitCode = await fs.promises.readFile('/tmp/falalo_exit_code', 'utf8');
+                            const actualExitCode = parseInt(capturedExitCode.trim(), 10);
+
+                            if (actualExitCode !== 0) {
+                                if (retryCount < this.maxRetries - 1) {
+                                    this.addMessageToChat('assistant', `⚠️ Command failed with exit code ${actualExitCode}, retrying (attempt ${retryCount + 2}/${this.maxRetries})...`);
+                                    await new Promise(resolve => setTimeout(resolve, 2000));
+                                    const success = await this.executeCommandWithRetry(command, retryCount + 1);
+                                    resolve(success);
+                                } else {
+                                    this.addMessageToChat('assistant', `❌ Command failed after ${this.maxRetries} attempts. Skipping to next step.`);
+                                    resolve(false);
+                                }
+                            } else {
+                                this.terminalOutput = `${this.terminalOutput}\n$ ${command}\nExit code: ${actualExitCode}\n`;
+                                this.addMessageToChat('assistant', `✅ Command executed successfully with exit code ${actualExitCode}`);
+                                resolve(true);
+                            }
+                        } catch (error) {
+                            if (retryCount < this.maxRetries - 1) {
+                                this.addMessageToChat('assistant', `⚠️ Command failed, retrying (attempt ${retryCount + 2}/${this.maxRetries})...`);
+                                await new Promise(resolve => setTimeout(resolve, 2000));
+                                const success = await this.executeCommandWithRetry(command, retryCount + 1);
+                                resolve(success);
+                            } else {
+                                this.addMessageToChat('assistant', `❌ Command failed after ${this.maxRetries} attempts. Skipping to next step.`);
+                                resolve(false);
+                            }
+                        }
+                    }
+                });
+
+                terminal.show();
+                // Wrap the command to capture its output and exit code
+                const wrappedCommand = process.platform === 'win32' 
+                    ? `${command} > %TEMP%\\falalo_output 2>&1 & echo %ERRORLEVEL% > %TEMP%\\falalo_exit_code`
+                    : `${command} 2>&1 | tee /tmp/falalo_output; echo $? > /tmp/falalo_exit_code`;
+                terminal.sendText(wrappedCommand);
+                terminal.sendText(process.platform === 'win32' ? 'exit' : 'exit;');
+            });
+        } catch (error) {
+            if (retryCount < this.maxRetries - 1) {
+                this.addMessageToChat('assistant', `⚠️ Command failed, retrying (attempt ${retryCount + 2}/${this.maxRetries})...`);
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                return this.executeCommandWithRetry(command, retryCount + 1);
+            } else {
+                this.addMessageToChat('assistant', `❌ Command failed after ${this.maxRetries} attempts. Skipping to next step.`);
+                return false;
+            }
+        }
+    }
+
     private async handleUserMessage(text: string) {
         try {
             if (!this._view) {
@@ -141,6 +209,9 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
             }
             if (excludedFiles.length > 0) {
                 contextInfo += '\nExcluded files from context:\n' + excludedFiles.join('\n');
+            }
+            if (this.terminalOutput) {
+                contextInfo += '\nRecent terminal output:\n' + this.terminalOutput;
             }
 
             // Stage 1: Planning Phase
@@ -262,14 +333,11 @@ Workspace context:${contextInfo}`;
                     if (commands.length > 0) {
                         this.addMessageToChat('assistant', '⚡ Executing commands after successful file creation:');
                         for (const command of commands) {
-                            try {
-                                const terminal = vscode.window.createTerminal('Falalo Execution');
-                                terminal.sendText(command);
-                                terminal.show();
-                                this.addMessageToChat('assistant', `📝 Running: ${command}`);
-                                await new Promise(resolve => setTimeout(resolve, 2000));
-                            } catch (error) {
-                                this.addMessageToChat('assistant', `❌ Error executing command: ${command}\nError: ${error instanceof Error ? error.message : 'Unknown error'}`);
+                            this.addMessageToChat('assistant', `📝 Running: ${command}`);
+                            const success = await this.executeCommandWithRetry(command);
+                            if (!success) {
+                                this.addMessageToChat('assistant', '⚠️ Skipping remaining commands in this step due to failure.');
+                                break;
                             }
                         }
                     }

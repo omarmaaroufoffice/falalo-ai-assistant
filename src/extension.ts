@@ -507,8 +507,13 @@ ${text}`;
             let hasErrors = false;
             
             for (const step of steps) {
-                // Prepare execution instructions for each step
-                const executionInstructions = `You are an execution AI. Your role is to implement the following step:
+                let retryCount = 0;
+                let success = false;
+                let lastErrors: string[] = [];
+
+                while (!success && retryCount < 4) {
+                    // Prepare execution instructions for each step
+                    let executionInstructions = `You are an execution AI. Your role is to implement the following step:
 
 ${step}
 
@@ -532,28 +537,51 @@ When editing files, use these special markers:
    new file content
    #end-block#
 
-Note: If a file doesn't exist, it will be created automatically. Line numbers will be adjusted if they're out of range.
+Note: If a file doesn't exist, it will be created automatically. Line numbers will be adjusted if they're out of range.`;
 
-You have the following context about the workspace:${contextInfo}
+                    // Add error feedback for retries
+                    if (retryCount > 0) {
+                        executionInstructions += `\n\nPrevious attempt failed with these errors:
+${lastErrors.map(err => `- ${err}`).join('\n')}
 
-Please implement this step now.`;
+Please adjust your implementation to fix these issues.`;
+                    }
 
-                // Get implementation from AI
-                const executionModel = this.genAI.getGenerativeModel({ model: 'gemini-pro' });
-                const executionResult = await executionModel.generateContent(executionInstructions);
-                const implementation = executionResult.response.text();
-                
-                // Show the implementation
-                this.addMessageToChat('assistant', `📝 Executing Step: ${step}\n\n${implementation}`);
+                    executionInstructions += `\n\nYou have the following context about the workspace:${contextInfo}\n\nPlease implement this step now.`;
 
-                // Process any file creation markers in the implementation
-                await this.processFileCreationMarkers(implementation);
+                    // Get implementation from AI
+                    const executionModel = this.genAI.getGenerativeModel({ model: 'gemini-pro' });
+                    const executionResult = await executionModel.generateContent(executionInstructions);
+                    const implementation = executionResult.response.text();
+                    
+                    // Show the implementation
+                    if (retryCount === 0) {
+                        this.addMessageToChat('assistant', `📝 Executing Step: ${step}\n\n${implementation}`);
+                    } else {
+                        this.addMessageToChat('assistant', `🔄 Retry #${retryCount} for Step: ${step}\n\n${implementation}`);
+                    }
 
-                // Process any edit markers in the implementation and collect errors
-                const editResult = await EditManager.processEditMarkers(implementation);
-                if (!editResult.success) {
-                    hasErrors = true;
-                    this.addMessageToChat('assistant', '❌ Errors occurred during this step:\n' + editResult.errors.join('\n'));
+                    // Process any file creation markers in the implementation
+                    await this.processFileCreationMarkers(implementation);
+
+                    // Process any edit markers in the implementation and collect errors
+                    const editResult = await EditManager.processEditMarkers(implementation);
+                    if (!editResult.success) {
+                        hasErrors = true;
+                        lastErrors = editResult.errors;
+                        retryCount++;
+                        
+                        if (retryCount < 4) {
+                            this.addMessageToChat('assistant', `⚠️ Attempt failed with errors. Retrying (${retryCount}/3):\n${lastErrors.join('\n')}`);
+                        } else {
+                            this.addMessageToChat('assistant', '❌ Maximum retries reached. Errors:\n' + lastErrors.join('\n'));
+                        }
+                    } else {
+                        success = true;
+                        if (retryCount > 0) {
+                            this.addMessageToChat('assistant', '✅ Successfully fixed the errors on retry!');
+                        }
+                    }
                 }
             }
 

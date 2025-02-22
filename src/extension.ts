@@ -83,6 +83,7 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     private activeTerminals: Map<string, vscode.Terminal> = new Map();
     private tokenCount: { input: number, output: number } = { input: 0, output: 0 };
     private tokenCountPanel?: vscode.WebviewPanel;
+    private executedCommands: Set<string> = new Set();
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -250,6 +251,13 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     private async executeCommandWithRetry(command: string, retryCount = 0): Promise<boolean> {
+        // Check if command was already executed to prevent loops
+        if (this.executedCommands.has(command)) {
+            this.addMessageToChat('assistant', `⚠️ Skipping command that was already executed: ${command}`);
+            return false;
+        }
+        this.executedCommands.add(command);
+
         try {
             return new Promise<boolean>((resolve) => {
                 const terminalId = `Falalo-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -485,7 +493,25 @@ Focus on:
     }
 
     private async executeStep(step: {content: string, isLongRunning: boolean}, text: string, contextInfo: string, stepIndex: number): Promise<void> {
-        // Prepare execution instructions for this step WITH full context
+        if (!vscode.workspace.workspaceFolders) {
+            throw new Error('No workspace folder is open');
+        }
+        const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
+
+        // Get all existing files in workspace for duplicate checking
+        const existingFiles = await glob.glob('**/*', { 
+            cwd: workspaceRoot,
+            nodir: true,
+            ignore: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**']
+        });
+
+        // Add full file paths to context
+        let fullPathContext = '\nWorkspace files with full paths:\n';
+        for (const file of existingFiles) {
+            fullPathContext += `${path.join(workspaceRoot, file)}\n`;
+        }
+
+        // Prepare execution instructions for this step WITH full context and paths
         const executionInstructions = `Original user request: "${text}"
 
 Current step to implement: ${step.content}
@@ -498,13 +524,18 @@ Requirements:
 4. Use TypeScript/JavaScript where possible
 5. Add error handling and logging
 6. Follow security practices
+7. DO NOT create files that already exist, instead modify them if needed
 
 File Creation Format:
 ### filename.ext
 content
 %%%
 
-Workspace context:${contextInfo}`;
+Workspace context:${contextInfo}
+${fullPathContext}
+
+Existing files (DO NOT recreate these):
+${existingFiles.join('\n')}`;
 
         // Get implementation from AI with full context
         const executionCompletion = await this.openai.chat.completions.create({
@@ -512,7 +543,7 @@ Workspace context:${contextInfo}`;
             messages: [
                 { 
                     role: 'system', 
-                    content: 'You are a software developer. Create ONE file at a time and execute ONE command at a time. Always wait for each operation to complete before starting the next.' 
+                    content: 'You are a software developer. Create ALL files first, then list ALL commands. Never recreate existing files. Always wait for each operation to complete before starting the next.' 
                 },
                 { role: 'user', content: text },
                 { role: 'assistant', content: 'I will help implement this step of your request.' },
@@ -536,28 +567,42 @@ Workspace context:${contextInfo}`;
         
         const commands = [...implementation.matchAll(commandRegex)].map(match => match[1]);
 
-        // Process files one at a time
+        // FIRST: Process all files before executing any commands
+        this.addMessageToChat('assistant', `📝 Step ${stepIndex + 1}: Creating ${files.length} files...`);
+        
         for (const file of files) {
-            this.addMessageToChat('assistant', `📝 Creating file: ${file.path}`);
+            const fullPath = path.join(workspaceRoot, file.path);
+            const relativePath = path.relative(workspaceRoot, fullPath);
+
+            // Check if file already exists
+            if (existingFiles.includes(relativePath)) {
+                this.addMessageToChat('assistant', `⚠️ File already exists: ${file.path} - Skipping creation`);
+                continue;
+            }
+
             try {
                 await this.createFile(file.path, file.content);
+                // Add the newly created file to our tracking
+                existingFiles.push(relativePath);
                 // Add a small delay after file creation
                 await new Promise(resolve => setTimeout(resolve, 500));
             } catch (error) {
                 this.addMessageToChat('assistant', `❌ Error creating file ${file.path}: ${error instanceof Error ? error.message : 'Unknown error'}`);
-                return;
+                throw error; // Rethrow to stop execution if file creation fails
             }
         }
 
-        // Process commands one at a time
+        // SECOND: Only after ALL files are created, execute commands
         if (commands.length > 0) {
+            this.addMessageToChat('assistant', `⚡ Step ${stepIndex + 1}: Executing ${commands.length} commands...`);
+            
             for (const command of commands) {
-                this.addMessageToChat('assistant', `⚡ Executing command: ${command}`);
+                this.addMessageToChat('assistant', `🔄 Executing command: ${command}`);
                 const success = await this.executeCommandWithRetry(command);
                 
                 if (!success && !step.isLongRunning) {
                     this.addMessageToChat('assistant', `❌ Command failed: ${command}`);
-                    return;
+                    throw new Error(`Command failed: ${command}`);
                 }
                 
                 // Add a delay between commands
@@ -937,12 +982,13 @@ console.log(greeting);
         `;
     }
 
-    // Add cleanup method for terminals
+    // Add cleanup method for terminals and command tracking
     private cleanupTerminals() {
         for (const [id, terminal] of this.activeTerminals) {
             terminal.dispose();
         }
         this.activeTerminals.clear();
+        this.executedCommands.clear();
     }
 
     // Update deactivate to clean up terminals and save token counts
@@ -963,10 +1009,15 @@ console.log(greeting);
             const errorAnalysisInstructions = `
 Command failed: "${command}"
 Error message: "${error}"
-Error output: "${output}"
+Error output: "${error}"
 Full output: "${output}"
 
-Analyze the error and suggest a solution. If code changes are needed, specify them using the following format:
+Analyze the error and suggest a solution. IMPORTANT:
+1. DO NOT suggest the exact same command that failed
+2. If suggesting a similar command, explain how it's different
+3. Focus on fixing the root cause of the error
+
+If code changes are needed, specify them using the following format:
 
 For file modifications:
 EDIT_FILE: filename
@@ -984,7 +1035,7 @@ $ command
 
 Focus on:
 1. Understanding the root cause of the error
-2. Suggesting specific fixes
+2. Suggesting specific fixes that are different from the failed command
 3. Providing step-by-step recovery instructions`;
 
             const errorAnalysis = await this.openai.chat.completions.create({
@@ -992,7 +1043,7 @@ Focus on:
                 messages: [
                     { 
                         role: 'system', 
-                        content: 'You are an error analysis and recovery expert. Analyze command failures and suggest specific solutions.' 
+                        content: 'You are an error analysis and recovery expert. Never suggest the exact same command that failed. Always suggest alternative solutions.' 
                     },
                     { role: 'user', content: errorAnalysisInstructions }
                 ]
@@ -1017,7 +1068,6 @@ Focus on:
                             recoverySuccessful = true;
                         } catch (error) {
                             this.addMessageToChat('assistant', `⚠️ Failed to edit ${file}: ${error}`);
-                            // Continue with other recovery methods
                         }
                     }
                 }
@@ -1029,7 +1079,6 @@ Focus on:
                 recoverySuccessful = true;
             } catch (error) {
                 this.addMessageToChat('assistant', `⚠️ Failed to create new files: ${error}`);
-                // Continue with recovery commands
             }
 
             // Process recovery commands
@@ -1038,12 +1087,17 @@ Focus on:
             
             if (recoveryCommands.length > 0) {
                 this.addMessageToChat('assistant', '🔧 Executing recovery commands:');
-                const results = await Promise.all(recoveryCommands.map(async cmd => {
-                    if (cmd === command) {
-                        this.addMessageToChat('assistant', `⚠️ Skipping original failed command to prevent loop: ${cmd}`);
-                        return { command: cmd, success: false };
-                    }
-                    this.addMessageToChat('assistant', `📝 Running: ${cmd}`);
+                
+                // Filter out any commands that were already executed
+                const newCommands = recoveryCommands.filter(cmd => !this.executedCommands.has(cmd));
+                
+                if (newCommands.length === 0) {
+                    this.addMessageToChat('assistant', '⚠️ All suggested recovery commands have already been executed. Stopping to prevent loops.');
+                    return false;
+                }
+
+                const results = await Promise.all(newCommands.map(async cmd => {
+                    this.addMessageToChat('assistant', `📝 Running new command: ${cmd}`);
                     return {
                         command: cmd,
                         success: await this.executeCommandWithRetry(cmd)

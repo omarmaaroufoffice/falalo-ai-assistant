@@ -1,0 +1,16 @@
+.vscode/**
+.vscode-test/**
+src/**
+.gitignore
+.yarnrc
+vsc-extension-quickstart.md
+**/tsconfig.json
+**/.eslintrc.json
+**/*.map
+**/*.ts
+.venv/**
+node_modules/**
+!node_modules/@google/generative-ai/**
+!node_modules/google-auth-library/**
+!node_modules/glob/**
+!node_modules/minimatch/** 

@@ -144,19 +144,45 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
             // Stage 1: Planning Phase
             const planningInstructions = `You are a planning AI. Your role is to:
 1. Analyze the user's request and break it down into specific, actionable steps
-2. Each step should be clear and achievable
-3. Steps should be in logical order
-4. Include any dependencies or prerequisites
+2. Each step should be clear, achievable, and highly detailed
+3. Steps should be in logical order with clear dependencies
+4. Include all necessary prerequisites, including:
+   - Required dependencies and versions
+   - Environment setup
+   - Configuration files
+   - Directory structure
 5. Format your response as a numbered list
-6. Be specific about file operations, code changes, or other actions needed
+6. Be extremely specific about:
+   - File operations and exact paths
+   - Code changes with full context
+   - Package management
+   - Testing requirements
+   - Error handling
+   - Documentation needs
+7. Consider cross-platform compatibility
+8. Include security best practices
+9. Plan for proper error handling and validation
+10. Include necessary TypeScript types and interfaces
+11. Consider performance implications
+12. Plan for proper documentation (JSDoc, README updates)
+
+Remember to make all code extensive, detailed, and production-ready with:
+- Complete error handling
+- Comprehensive input validation
+- Proper TypeScript types
+- Detailed comments and documentation
+- Best practices for performance
+- Security considerations
+- Cross-platform compatibility
+- Proper testing setup
 
 You have the following context about the workspace:${contextInfo}
 
-Please analyze this request and provide a step-by-step plan:
+Please analyze this request and provide a detailed step-by-step plan:
 ${text}`;
 
             // Get plan from AI
-            const planningModel = this.genAI.getGenerativeModel({ model: 'gemini-pro' });
+            const planningModel = this.genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
             const planResult = await planningModel.generateContent(planningInstructions);
             const plan = planResult.response.text();
             
@@ -168,22 +194,45 @@ ${text}`;
             
             for (const step of steps) {
                 // Prepare execution instructions for each step
-                const executionInstructions = `You are an execution AI. Your role is to implement the following step:
+                const executionInstructions = `You are an execution AI. Your role is to implement the following step with extensive, production-ready code:
 
 ${step}
+
+When implementing code:
+1. Write COMPLETE, EXTENSIVE, and DETAILED implementations
+2. Include ALL necessary imports and dependencies
+3. Add comprehensive error handling
+4. Include detailed TypeScript types and interfaces
+5. Add extensive JSDoc documentation
+6. Implement proper input validation
+7. Follow security best practices
+8. Consider cross-platform compatibility
+9. Add detailed comments explaining complex logic
+10. Include logging for important operations
+11. Implement proper error messages
+12. Consider performance optimizations
+13. Add necessary unit tests
+14. Update relevant documentation
 
 When creating files, follow these rules exactly:
 1. Start with "###" followed by the filename on its own line
 2. Put the EXACT file content on the next line(s) WITHOUT any markdown formatting
 3. End with "%%%" on its own line
 4. Leave one blank line between multiple files
+5. Include ALL necessary files (configs, types, tests, etc.)
+6. Add detailed comments and documentation
+7. Include complete error handling
+8. Add proper TypeScript types
+9. Include necessary package.json updates
+
+NEVER write placeholder code or TODO comments. Always implement FULL, COMPLETE, and PRODUCTION-READY code.
 
 You have the following context about the workspace:${contextInfo}
 
-Please implement this step now.`;
+Please implement this step now with complete, production-ready code.`;
 
                 // Get implementation from AI
-                const executionModel = this.genAI.getGenerativeModel({ model: 'gemini-pro' });
+                const executionModel = this.genAI.getGenerativeModel({ model: 'gemin-2.0-flash' });
                 const executionResult = await executionModel.generateContent(executionInstructions);
                 const implementation = executionResult.response.text();
                 
@@ -195,7 +244,7 @@ Please implement this step now.`;
             }
 
             // Final completion message
-            this.addMessageToChat('assistant', '✅ All steps have been completed!');
+            this.addMessageToChat('assistant', '✅ All steps have been completed with full implementation!');
         } catch (error) {
             vscode.window.showErrorMessage(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
             this.addMessageToChat('assistant', '❌ An error occurred while processing your request.');

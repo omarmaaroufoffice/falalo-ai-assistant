@@ -15,8 +15,8 @@ class ContextManager {
     constructor() {
         const config = vscode.workspace.getConfiguration('falalo');
         this.maxFiles = config.get('maxContextFiles', 500);
-        this.inclusions = config.get('contextInclusions', []);
-        this.exclusions = config.get('contextExclusions', []);
+        this.inclusions = config.get('contextInclusions', ['**/*']);  // Default to include all files
+        this.exclusions = config.get('contextExclusions', ['**/node_modules/**', '**/.git/**']);  // Only exclude node_modules and .git
         this.updateContext();
     }
 
@@ -28,7 +28,7 @@ class ContextManager {
         const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
         const files = await glob.glob('**/*', { 
             cwd: workspaceRoot,
-            nodir: true,
+            nodir: false,  // Include directories
             ignore: this.exclusions
         });
 
@@ -42,6 +42,12 @@ class ContextManager {
     }
 
     private shouldIncludeFile(file: string): boolean {
+        // Always include certain important file types
+        if (file.match(/\.(ts|js|json|md|txt|html|css|py|java|cpp|h|c|go|rs|php)$/i)) {
+            return true;
+        }
+        
+        // Check against inclusion/exclusion patterns
         return this.inclusions.some(pattern => minimatch(file, pattern)) &&
                !this.exclusions.some(pattern => minimatch(file, pattern));
     }
@@ -240,11 +246,116 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
         };
 
         webviewView.webview.html = this._getHtmlForWebview();
+        
+        // Initial file list update
+        if (this.fileViewProvider) {
+            this.fileViewProvider.updateFileList();
+        }
 
+        // Set up file system watcher with more specific patterns
+        const watchers = [
+            vscode.workspace.createFileSystemWatcher('**/*.*'),  // Watch all files
+            vscode.workspace.createFileSystemWatcher('**/'),     // Watch directories
+        ];
+
+        // Set up event handlers for each watcher
+        watchers.forEach(watcher => {
+            watcher.onDidCreate(() => {
+                console.log('File created, updating list...');
+                if (this.fileViewProvider) {
+                    this.fileViewProvider.updateFileList();
+                }
+            });
+            watcher.onDidDelete(() => {
+                console.log('File deleted, updating list...');
+                if (this.fileViewProvider) {
+                    this.fileViewProvider.updateFileList();
+                }
+            });
+            watcher.onDidChange(() => {
+                console.log('File changed, updating list...');
+                if (this.fileViewProvider) {
+                    this.fileViewProvider.updateFileList();
+                }
+            });
+
+            // Add watcher to be disposed when the extension is deactivated
+            if (this._extensionContext && this._extensionContext.subscriptions) {
+                this._extensionContext.subscriptions.push(watcher);
+            }
+        });
+
+        // Handle messages from the webview
         webviewView.webview.onDidReceiveMessage(async message => {
             switch (message.type) {
-                case 'message':
-                    await this.handleUserMessage(message.text);
+                case 'openFile':
+                    try {
+                        // Ensure the file path is within the workspace
+                        if (!vscode.workspace.workspaceFolders) {
+                            throw new Error('No workspace folder is open');
+                        }
+                        const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
+                        const fullPath = path.join(workspaceRoot, message.path);
+                        
+                        // Check if file exists before trying to open it
+                        if (!fs.existsSync(fullPath)) {
+                            throw new Error(`File does not exist: ${message.path}`);
+                        }
+                        
+                        // Create VS Code URI for the file
+                        const fileUri = vscode.Uri.file(fullPath);
+                        
+                        // Try to open the document
+                        const document = await vscode.workspace.openTextDocument(fileUri);
+                        await vscode.window.showTextDocument(document);
+                    } catch (error) {
+                        vscode.window.showErrorMessage(`Failed to open file: ${error instanceof Error ? error.message : 'Unknown error'}`);
+                    }
+                    break;
+                case 'toggleFileContext':
+                    try {
+                        if (message.isIncluded) {
+                            await this.contextManager.includeFile(message.path);
+                            vscode.window.showInformationMessage(`Added ${message.path} to context`);
+                        } else if (message.isExcluded) {
+                            this.contextManager.excludeFile(message.path);
+                            vscode.window.showInformationMessage(`Excluded ${message.path} from context`);
+                        } else {
+                            this.contextManager.excludeFile(message.path);
+                            vscode.window.showInformationMessage(`Removed ${message.path} from context`);
+                        }
+                        if (this.fileViewProvider) {
+                            this.fileViewProvider.updateFileList();
+                        }
+                    } catch (error) {
+                        vscode.window.showErrorMessage((error as Error).message);
+                    }
+                    break;
+                case 'toggleDirectoryContext':
+                    try {
+                        const files = message.files;
+                        if (message.isIncluded) {
+                            for (const file of files) {
+                                await this.contextManager.includeFile(file);
+                            }
+                            vscode.window.showInformationMessage(`Added directory contents to context`);
+                        } else if (message.isExcluded) {
+                            for (const file of files) {
+                                this.contextManager.excludeFile(file);
+                            }
+                            vscode.window.showInformationMessage(`Excluded directory contents from context`);
+                        } else {
+                            for (const file of files) {
+                                this.contextManager.excludeFile(file);
+                            }
+                            vscode.window.showInformationMessage(`Removed directory contents from context`);
+                        }
+                        if (this.fileViewProvider) {
+                            this.fileViewProvider.updateFileList();
+                        }
+                    } catch (error) {
+                        vscode.window.showErrorMessage((error as Error).message);
+                    }
                     break;
             }
         });
@@ -621,6 +732,49 @@ ${existingFiles.join('\n')}`;
         const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
         const fullPath = path.join(workspaceRoot, filePath);
 
+        // Check if file already exists
+        if (fs.existsSync(fullPath)) {
+            // Read existing file content
+            const existingContent = await fs.promises.readFile(fullPath, 'utf8');
+            const existingLength = existingContent.trim().length;
+            const newLength = content.trim().length;
+
+            if (newLength <= existingLength) {
+                const errorMessage = `
+⚠️ File already exists: ${filePath}
+The new code (${newLength} chars) is not longer than the existing code (${existingLength} chars).
+
+To modify this file, please use one of these methods:
+1. Block modification:
+   EDIT_FILE: ${filePath}
+   START_BLOCK: [block_identifier]
+   your new code
+   END_BLOCK
+
+2. Line number modification:
+   EDIT_FILE: ${filePath}
+   START_BLOCK: [line_number]
+   your new code
+   END_BLOCK
+
+3. For multiple blocks:
+   EDIT_FILE: ${filePath}
+   START_BLOCK: block1
+   your new code
+   END_BLOCK
+   START_BLOCK: block2
+   more new code
+   END_BLOCK
+
+Please ensure your changes improve the code quality and functionality.`;
+            
+                this.addMessageToChat('assistant', errorMessage);
+                throw new Error(`File exists and new content is not longer: ${filePath}`);
+            } else {
+                this.addMessageToChat('assistant', `📝 Replacing existing file with longer version (${newLength} vs ${existingLength} chars): ${filePath}`);
+            }
+        }
+
         // Create directory if it doesn't exist
         await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
 
@@ -631,7 +785,7 @@ ${existingFiles.join('\n')}`;
         await this.contextManager.includeFile(filePath);
 
         // Show success message
-        this.addMessageToChat('assistant', `✅ Created file: ${filePath}`);
+        this.addMessageToChat('assistant', `✅ ${fs.existsSync(fullPath) ? 'Updated' : 'Created'} file: ${filePath}`);
 
         // Open the file in editor (one at a time)
         const document = await vscode.workspace.openTextDocument(fullPath);
@@ -1244,11 +1398,32 @@ class FileViewProvider implements vscode.WebviewViewProvider {
         // Initial file list update
         this.updateFileList();
 
-        // Set up file system watcher
-        const watcher = vscode.workspace.createFileSystemWatcher('**/*');
-        watcher.onDidCreate(() => this.updateFileList());
-        watcher.onDidDelete(() => this.updateFileList());
-        watcher.onDidChange(() => this.updateFileList());
+        // Set up file system watcher with more specific patterns
+        const watchers = [
+            vscode.workspace.createFileSystemWatcher('**/*.*'),  // Watch all files
+            vscode.workspace.createFileSystemWatcher('**/'),     // Watch directories
+        ];
+
+        // Set up event handlers for each watcher
+        watchers.forEach(watcher => {
+            watcher.onDidCreate(() => {
+                console.log('File created, updating list...');
+                this.updateFileList();
+            });
+            watcher.onDidDelete(() => {
+                console.log('File deleted, updating list...');
+                this.updateFileList();
+            });
+            watcher.onDidChange(() => {
+                console.log('File changed, updating list...');
+                this.updateFileList();
+            });
+
+            // Add watcher to be disposed when the extension is deactivated
+            if (this._extensionContext && this._extensionContext.subscriptions) {
+                this._extensionContext.subscriptions.push(watcher);
+            }
+        });
 
         // Handle messages from the webview
         webviewView.webview.onDidReceiveMessage(async message => {
@@ -1330,8 +1505,8 @@ class FileViewProvider implements vscode.WebviewViewProvider {
         const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
         const files = await glob.glob('**/*', { 
             cwd: workspaceRoot,
-            nodir: true,
-            ignore: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**']
+            nodir: false,  // Include directories
+            ignore: ['**/node_modules/**', '**/.git/**']  // Only ignore node_modules and .git
         });
 
         // Sort files by path
@@ -1344,10 +1519,13 @@ class FileViewProvider implements vscode.WebviewViewProvider {
         // Build file tree with status
         const fileTree = this.buildFileTree(files, includedFiles, excludedFiles);
 
-        this._view.webview.postMessage({
-            type: 'updateFiles',
-            files: fileTree
-        });
+        // Ensure the view exists before sending message
+        if (this._view) {
+            this._view.webview.postMessage({
+                type: 'updateFiles',
+                files: fileTree
+            });
+        }
     }
 
     private buildFileTree(files: string[], includedFiles: string[], excludedFiles: string[]) {

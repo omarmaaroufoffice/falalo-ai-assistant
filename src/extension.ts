@@ -8,6 +8,7 @@ import * as path from 'path';
 
 class ContextManager {
     private includedFiles: Set<string> = new Set();
+    private excludedFiles: Set<string> = new Set();
     private readonly maxFiles: number;
     private readonly inclusions: string[];
     private readonly exclusions: string[];
@@ -33,6 +34,7 @@ class ContextManager {
         });
 
         this.includedFiles.clear();
+        this.excludedFiles.clear();
         for (const file of files) {
             if (this.shouldIncludeFile(file) && this.includedFiles.size < this.maxFiles) {
                 this.includedFiles.add(file);
@@ -49,15 +51,26 @@ class ContextManager {
         return Array.from(this.includedFiles);
     }
 
+    public getExcludedFiles(): string[] {
+        return Array.from(this.excludedFiles);
+    }
+
     public async includeFile(file: string) {
         if (this.includedFiles.size >= this.maxFiles) {
             throw new Error(`Cannot include more than ${this.maxFiles} files in context`);
         }
         this.includedFiles.add(file);
+        this.excludedFiles.delete(file);
     }
 
     public excludeFile(file: string) {
         this.includedFiles.delete(file);
+        this.excludedFiles.add(file);
+    }
+
+    public removeFromContext(file: string) {
+        this.includedFiles.delete(file);
+        this.excludedFiles.delete(file);
     }
 }
 
@@ -68,7 +81,8 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
-        private readonly _extensionContext: vscode.ExtensionContext
+        private readonly _extensionContext: vscode.ExtensionContext,
+        private readonly contextManager: ContextManager
     ) {
         const config = vscode.workspace.getConfiguration('falalo');
         const apiKey = config.get('googleApiKey', '');
@@ -109,8 +123,23 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
             // Add user message to chat
             this.addMessageToChat('user', text);
 
-            // Prepare the message with file creation instructions
-            const aiInstructions = `When responding with code or file content:
+            // Get included files for context
+            const includedFiles = this.contextManager.getIncludedFiles();
+            const excludedFiles = this.contextManager.getExcludedFiles();
+
+            // Prepare context information
+            let contextInfo = '';
+            if (includedFiles.length > 0) {
+                contextInfo += '\nIncluded files in context:\n' + includedFiles.join('\n');
+            }
+            if (excludedFiles.length > 0) {
+                contextInfo += '\nExcluded files from context:\n' + excludedFiles.join('\n');
+            }
+
+            // Prepare the message with file creation instructions and context
+            const aiInstructions = `You have the following context about the workspace:${contextInfo}
+
+When responding with code or file content:
 1. First provide your normal response with any explanations and code blocks
 2. AFTER your response, if files need to be created, add them using this format:
 
@@ -419,11 +448,15 @@ console.log('Hello');
 class FileViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'falaloFiles';
     private _view?: vscode.WebviewView;
+    private contextManager: ContextManager;
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
-        private readonly _extensionContext: vscode.ExtensionContext
-    ) {}
+        private readonly _extensionContext: vscode.ExtensionContext,
+        contextManager: ContextManager
+    ) {
+        this.contextManager = contextManager;
+    }
 
     public resolveWebviewView(
         webviewView: vscode.WebviewView,
@@ -457,6 +490,47 @@ class FileViewProvider implements vscode.WebviewViewProvider {
                     const document = await vscode.workspace.openTextDocument(message.path);
                     await vscode.window.showTextDocument(document);
                     break;
+                case 'toggleFileContext':
+                    try {
+                        if (message.isIncluded) {
+                            await this.contextManager.includeFile(message.path);
+                            vscode.window.showInformationMessage(`Added ${message.path} to context`);
+                        } else if (message.isExcluded) {
+                            this.contextManager.excludeFile(message.path);
+                            vscode.window.showInformationMessage(`Excluded ${message.path} from context`);
+                        } else {
+                            this.contextManager.excludeFile(message.path);
+                            vscode.window.showInformationMessage(`Removed ${message.path} from context`);
+                        }
+                        this.updateFileList();
+                    } catch (error) {
+                        vscode.window.showErrorMessage((error as Error).message);
+                    }
+                    break;
+                case 'toggleDirectoryContext':
+                    try {
+                        const files = message.files;
+                        if (message.isIncluded) {
+                            for (const file of files) {
+                                await this.contextManager.includeFile(file);
+                            }
+                            vscode.window.showInformationMessage(`Added directory contents to context`);
+                        } else if (message.isExcluded) {
+                            for (const file of files) {
+                                this.contextManager.excludeFile(file);
+                            }
+                            vscode.window.showInformationMessage(`Excluded directory contents from context`);
+                        } else {
+                            for (const file of files) {
+                                this.contextManager.excludeFile(file);
+                            }
+                            vscode.window.showInformationMessage(`Removed directory contents from context`);
+                        }
+                        this.updateFileList();
+                    } catch (error) {
+                        vscode.window.showErrorMessage((error as Error).message);
+                    }
+                    break;
             }
         });
     }
@@ -476,8 +550,12 @@ class FileViewProvider implements vscode.WebviewViewProvider {
         // Sort files by path
         files.sort();
 
-        // Group files by directory
-        const fileTree = this.buildFileTree(files);
+        // Get included files from context manager
+        const includedFiles = this.contextManager.getIncludedFiles();
+        const excludedFiles = this.contextManager.getExcludedFiles();
+
+        // Build file tree with status
+        const fileTree = this.buildFileTree(files, includedFiles, excludedFiles);
 
         this._view.webview.postMessage({
             type: 'updateFiles',
@@ -485,28 +563,38 @@ class FileViewProvider implements vscode.WebviewViewProvider {
         });
     }
 
-    private buildFileTree(files: string[]) {
+    private buildFileTree(files: string[], includedFiles: string[], excludedFiles: string[]) {
         const tree: any = {};
         
         for (const file of files) {
             const parts = file.split('/');
             let current = tree;
+            let currentPath = '';
             
             for (let i = 0; i < parts.length; i++) {
                 const part = parts[i];
+                currentPath = currentPath ? `${currentPath}/${part}` : part;
+                
                 if (i === parts.length - 1) {
                     // It's a file
                     if (!current.files) {
                         current.files = [];
                     }
-                    current.files.push(part);
+                    current.files.push({
+                        name: part,
+                        path: currentPath,
+                        isIncluded: includedFiles.includes(currentPath),
+                        isExcluded: excludedFiles.includes(currentPath)
+                    });
                 } else {
                     // It's a directory
                     if (!current.dirs) {
                         current.dirs = {};
                     }
                     if (!current.dirs[part]) {
-                        current.dirs[part] = {};
+                        current.dirs[part] = {
+                            path: currentPath
+                        };
                     }
                     current = current.dirs[part];
                 }
@@ -540,8 +628,9 @@ class FileViewProvider implements vscode.WebviewViewProvider {
                     }
                     .directory-name {
                         cursor: pointer;
-                        color: var(--vscode-symbolIcon-folderForeground);
                         padding: 2px 0;
+                        display: flex;
+                        align-items: center;
                     }
                     .directory-name:hover {
                         background-color: var(--vscode-list-hoverBackground);
@@ -550,6 +639,8 @@ class FileViewProvider implements vscode.WebviewViewProvider {
                         margin-left: 20px;
                         cursor: pointer;
                         padding: 2px 0;
+                        display: flex;
+                        align-items: center;
                     }
                     .file:hover {
                         background-color: var(--vscode-list-hoverBackground);
@@ -560,6 +651,49 @@ class FileViewProvider implements vscode.WebviewViewProvider {
                     .icon {
                         margin-right: 5px;
                     }
+                    .included {
+                        color: #0098ff;
+                    }
+                    .excluded {
+                        color: #ff8c00;
+                    }
+                    .context-indicator {
+                        width: 8px;
+                        height: 8px;
+                        border-radius: 50%;
+                        margin-left: 5px;
+                    }
+                    .context-indicator.included {
+                        background-color: #0098ff;
+                    }
+                    .context-indicator.excluded {
+                        background-color: #ff8c00;
+                    }
+                    .actions {
+                        margin-left: auto;
+                        display: flex;
+                        gap: 5px;
+                    }
+                    .action-button {
+                        padding: 2px 4px;
+                        border-radius: 3px;
+                        font-size: 10px;
+                        cursor: pointer;
+                        opacity: 0;
+                        transition: opacity 0.2s;
+                    }
+                    .file:hover .action-button,
+                    .directory-name:hover .action-button {
+                        opacity: 1;
+                    }
+                    .include-button {
+                        background-color: #0098ff33;
+                        color: #0098ff;
+                    }
+                    .exclude-button {
+                        background-color: #ff8c0033;
+                        color: #ff8c00;
+                    }
                 </style>
             </head>
             <body>
@@ -567,6 +701,19 @@ class FileViewProvider implements vscode.WebviewViewProvider {
                 <script>
                     const vscode = acquireVsCodeApi();
                     const fileTree = document.getElementById('file-tree');
+
+                    function getAllFilesInDirectory(dirContent) {
+                        let files = [];
+                        if (dirContent.files) {
+                            files.push(...dirContent.files.map(f => f.path));
+                        }
+                        if (dirContent.dirs) {
+                            for (const [_, content] of Object.entries(dirContent.dirs)) {
+                                files.push(...getAllFilesInDirectory(content));
+                            }
+                        }
+                        return files;
+                    }
 
                     function createFileTree(tree, parentElement, path = '') {
                         // Handle directories
@@ -577,7 +724,44 @@ class FileViewProvider implements vscode.WebviewViewProvider {
                                 const contentDiv = document.createElement('div');
                                 
                                 dirNameDiv.className = 'directory-name';
-                                dirNameDiv.innerHTML = '📁 ' + dirName;
+                                dirNameDiv.innerHTML = '<span class="icon">📁</span>' + dirName;
+                                
+                                // Add action buttons for directory
+                                const actionsDiv = document.createElement('div');
+                                actionsDiv.className = 'actions';
+                                
+                                const includeButton = document.createElement('span');
+                                includeButton.className = 'action-button include-button';
+                                includeButton.textContent = 'Include';
+                                includeButton.onclick = (e) => {
+                                    e.stopPropagation();
+                                    const files = getAllFilesInDirectory(content);
+                                    vscode.postMessage({
+                                        type: 'toggleDirectoryContext',
+                                        files: files,
+                                        isIncluded: true,
+                                        isExcluded: false
+                                    });
+                                };
+                                
+                                const excludeButton = document.createElement('span');
+                                excludeButton.className = 'action-button exclude-button';
+                                excludeButton.textContent = 'Exclude';
+                                excludeButton.onclick = (e) => {
+                                    e.stopPropagation();
+                                    const files = getAllFilesInDirectory(content);
+                                    vscode.postMessage({
+                                        type: 'toggleDirectoryContext',
+                                        files: files,
+                                        isIncluded: false,
+                                        isExcluded: true
+                                    });
+                                };
+                                
+                                actionsDiv.appendChild(includeButton);
+                                actionsDiv.appendChild(excludeButton);
+                                dirNameDiv.appendChild(actionsDiv);
+                                
                                 contentDiv.className = 'directory';
                                 
                                 dirDiv.appendChild(dirNameDiv);
@@ -586,10 +770,11 @@ class FileViewProvider implements vscode.WebviewViewProvider {
 
                                 dirNameDiv.addEventListener('click', () => {
                                     contentDiv.classList.toggle('collapsed');
-                                    dirNameDiv.innerHTML = (contentDiv.classList.contains('collapsed') ? '📁 ' : '📂 ') + dirName;
+                                    dirNameDiv.querySelector('.icon').textContent = 
+                                        contentDiv.classList.contains('collapsed') ? '📁' : '📂';
                                 });
 
-                                createFileTree(content, contentDiv, path + dirName + '/');
+                                createFileTree(content, contentDiv, content.path);
                             }
                         }
 
@@ -598,13 +783,65 @@ class FileViewProvider implements vscode.WebviewViewProvider {
                             for (const file of tree.files) {
                                 const fileDiv = document.createElement('div');
                                 fileDiv.className = 'file';
-                                fileDiv.innerHTML = '📄 ' + file;
+                                if (file.isIncluded) fileDiv.classList.add('included');
+                                if (file.isExcluded) fileDiv.classList.add('excluded');
+                                
+                                const icon = document.createElement('span');
+                                icon.className = 'icon';
+                                icon.textContent = '📄';
+                                
+                                const fileName = document.createElement('span');
+                                fileName.textContent = file.name;
+                                
+                                const indicator = document.createElement('span');
+                                indicator.className = 'context-indicator';
+                                if (file.isIncluded) indicator.classList.add('included');
+                                if (file.isExcluded) indicator.classList.add('excluded');
+                                
+                                const actionsDiv = document.createElement('div');
+                                actionsDiv.className = 'actions';
+                                
+                                const includeButton = document.createElement('span');
+                                includeButton.className = 'action-button include-button';
+                                includeButton.textContent = 'Include';
+                                includeButton.onclick = (e) => {
+                                    e.stopPropagation();
+                                    vscode.postMessage({
+                                        type: 'toggleFileContext',
+                                        path: file.path,
+                                        isIncluded: true,
+                                        isExcluded: false
+                                    });
+                                };
+                                
+                                const excludeButton = document.createElement('span');
+                                excludeButton.className = 'action-button exclude-button';
+                                excludeButton.textContent = 'Exclude';
+                                excludeButton.onclick = (e) => {
+                                    e.stopPropagation();
+                                    vscode.postMessage({
+                                        type: 'toggleFileContext',
+                                        path: file.path,
+                                        isIncluded: false,
+                                        isExcluded: true
+                                    });
+                                };
+                                
+                                actionsDiv.appendChild(includeButton);
+                                actionsDiv.appendChild(excludeButton);
+                                
+                                fileDiv.appendChild(icon);
+                                fileDiv.appendChild(fileName);
+                                fileDiv.appendChild(indicator);
+                                fileDiv.appendChild(actionsDiv);
+                                
                                 fileDiv.addEventListener('click', () => {
                                     vscode.postMessage({
                                         type: 'openFile',
-                                        path: path + file
+                                        path: file.path
                                     });
                                 });
+                                
                                 parentElement.appendChild(fileDiv);
                             }
                         }
@@ -628,8 +865,8 @@ class FileViewProvider implements vscode.WebviewViewProvider {
 
 export function activate(context: vscode.ExtensionContext) {
     const contextManager = new ContextManager();
-    const chatViewProvider = new ChatViewProvider(context.extensionUri, context);
-    const fileViewProvider = new FileViewProvider(context.extensionUri, context);
+    const chatViewProvider = new ChatViewProvider(context.extensionUri, context, contextManager);
+    const fileViewProvider = new FileViewProvider(context.extensionUri, context, contextManager);
 
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, chatViewProvider),

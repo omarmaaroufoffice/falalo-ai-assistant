@@ -81,6 +81,8 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     private terminalOutput: string = '';
     private readonly maxRetries: number = 4;
     private activeTerminals: Map<string, vscode.Terminal> = new Map();
+    private tokenCount: { input: number, output: number } = { input: 0, output: 0 };
+    private tokenCountPanel?: vscode.WebviewPanel;
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -93,6 +95,129 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
             apiKey: apiKey,
             dangerouslyAllowBrowser: true
         });
+
+        // Load saved token counts from extension context
+        const savedTokenCount = this._extensionContext.globalState.get('tokenCount') as { input: number, output: number } | undefined;
+        if (savedTokenCount && typeof savedTokenCount.input === 'number' && typeof savedTokenCount.output === 'number') {
+            this.tokenCount = savedTokenCount;
+        }
+        
+        this.createTokenCountPanel();
+    }
+
+    private createTokenCountPanel() {
+        this.tokenCountPanel = vscode.window.createWebviewPanel(
+            'tokenCounter',
+            'Token Counter',
+            { viewColumn: vscode.ViewColumn.Three, preserveFocus: true },
+            {
+                enableScripts: true,
+                retainContextWhenHidden: true
+            }
+        );
+
+        // Add reset button to panel
+        this.updateTokenCountPanel();
+
+        // Handle messages from the webview
+        this.tokenCountPanel.webview.onDidReceiveMessage(async message => {
+            if (message.command === 'resetTokens') {
+                await this.resetTokenCount();
+            }
+        });
+    }
+
+    private updateTokenCountPanel() {
+        if (this.tokenCountPanel) {
+            this.tokenCountPanel.webview.html = `
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <style>
+                        body {
+                            padding: 20px;
+                            font-family: var(--vscode-font-family);
+                            color: var(--vscode-editor-foreground);
+                        }
+                        .counter {
+                            display: flex;
+                            flex-direction: column;
+                            gap: 10px;
+                        }
+                        .count-item {
+                            display: flex;
+                            justify-content: space-between;
+                            padding: 10px;
+                            background: var(--vscode-editor-background);
+                            border: 1px solid var(--vscode-panel-border);
+                            border-radius: 4px;
+                        }
+                        .total {
+                            margin-top: 10px;
+                            padding-top: 10px;
+                            border-top: 1px solid var(--vscode-panel-border);
+                            font-weight: bold;
+                        }
+                        .reset-button {
+                            margin-top: 20px;
+                            padding: 8px 16px;
+                            background: var(--vscode-button-background);
+                            color: var(--vscode-button-foreground);
+                            border: none;
+                            border-radius: 4px;
+                            cursor: pointer;
+                        }
+                        .reset-button:hover {
+                            background: var(--vscode-button-hoverBackground);
+                        }
+                    </style>
+                </head>
+                <body>
+                    <div class="counter">
+                        <div class="count-item">
+                            <span>Total Input Tokens:</span>
+                            <strong>${this.tokenCount.input.toLocaleString()}</strong>
+                        </div>
+                        <div class="count-item">
+                            <span>Total Output Tokens:</span>
+                            <strong>${this.tokenCount.output.toLocaleString()}</strong>
+                        </div>
+                        <div class="count-item total">
+                            <span>Total Tokens:</span>
+                            <strong>${(this.tokenCount.input + this.tokenCount.output).toLocaleString()}</strong>
+                        </div>
+                    </div>
+                    <button class="reset-button" onclick="resetTokens()">Reset Token Count</button>
+                    <script>
+                        const vscode = acquireVsCodeApi();
+                        function resetTokens() {
+                            vscode.postMessage({ command: 'resetTokens' });
+                        }
+                    </script>
+                </body>
+                </html>
+            `;
+        }
+    }
+
+    private async updateTokenCount(completion: any) {
+        if (completion?.usage) {
+            // Add new tokens to existing counts
+            this.tokenCount.input += completion.usage.prompt_tokens || 0;
+            this.tokenCount.output += completion.usage.completion_tokens || 0;
+            
+            // Save updated counts to extension context
+            await this._extensionContext.globalState.update('tokenCount', this.tokenCount);
+            
+            this.updateTokenCountPanel();
+        }
+    }
+
+    // Add cleanup method for token counts
+    private async resetTokenCount() {
+        this.tokenCount = { input: 0, output: 0 };
+        await this._extensionContext.globalState.update('tokenCount', this.tokenCount);
+        this.updateTokenCountPanel();
     }
 
     public setFileViewProvider(provider: FileViewProvider) {
@@ -128,6 +253,14 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
         try {
             return new Promise<boolean>((resolve) => {
                 const terminalId = `Falalo-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+                let outputBuffer = '';
+                let errorBuffer = '';
+
+                // Create write streams for output and error logging
+                const outputPath = `/tmp/${terminalId}_output`;
+                const errorPath = `/tmp/${terminalId}_error`;
+                const exitCodePath = `/tmp/${terminalId}_exit_code`;
+
                 const terminal = vscode.window.createTerminal({
                     name: terminalId,
                     shellPath: process.platform === 'win32' ? 'cmd.exe' : '/bin/bash'
@@ -135,66 +268,89 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
 
                 this.activeTerminals.set(terminalId, terminal);
 
-                // Clean up terminal and check exit code when it closes
+                // Detect if this is a long-running command (like npm run dev)
+                const isLongRunningCommand = command.match(/(npm run (dev|start|serve)|ng serve|python manage\.py runserver|rails s|yarn (start|dev)|docker-compose up)/i);
+
+                // For long-running commands, we don't wait for completion
+                if (isLongRunningCommand) {
+                    this.addMessageToChat('assistant', `🚀 Starting long-running command in terminal ${terminalId}:\n${command}`);
+                    terminal.show(true);
+                    terminal.sendText(command);
+                    resolve(true);
+                    return;
+                }
+
+                // For regular commands, we monitor execution and handle errors
                 const disposable = vscode.window.onDidCloseTerminal(async closedTerminal => {
                     if (closedTerminal === terminal) {
                         disposable.dispose();
                         this.activeTerminals.delete(terminalId);
                         try {
-                            // Read the captured exit code
+                            // Read all captured output
                             const fs = require('fs');
-                            const capturedExitCode = await fs.promises.readFile(`/tmp/${terminalId}_exit_code`, 'utf8');
-                            const actualExitCode = parseInt(capturedExitCode.trim(), 10);
-                            const output = await fs.promises.readFile(`/tmp/${terminalId}_output`, 'utf8');
+                            const [output, errors, exitCodeStr] = await Promise.all([
+                                fs.promises.readFile(outputPath, 'utf8').catch(() => ''),
+                                fs.promises.readFile(errorPath, 'utf8').catch(() => ''),
+                                fs.promises.readFile(exitCodePath, 'utf8').catch(() => '1')
+                            ]);
+
+                            const actualExitCode = parseInt(exitCodeStr.trim(), 10);
+                            
+                            // Combine output and errors for context
+                            const fullOutput = `OUTPUT:\n${output}\n\nERRORS:\n${errors}`;
+                            this.terminalOutput = `${this.terminalOutput}\n$ ${command} (Terminal: ${terminalId})\n${fullOutput}\nExit code: ${actualExitCode}\n`;
 
                             if (actualExitCode !== 0) {
+                                this.addMessageToChat('assistant', `⚠️ Command failed with exit code ${actualExitCode}. Output:\n${fullOutput}`);
+                                
                                 if (retryCount < this.maxRetries - 1) {
-                                    this.addMessageToChat('assistant', `⚠️ Command failed with exit code ${actualExitCode}, retrying (attempt ${retryCount + 2}/${this.maxRetries})...`);
+                                    // Get AI suggestion before retrying - only pass error message
+                                    const recovered = await this.handleCommandFailure(command, errors, output);
+                                    if (recovered) {
+                                        resolve(true);
+                                        return;
+                                    }
+
+                                    this.addMessageToChat('assistant', `Retrying (attempt ${retryCount + 2}/${this.maxRetries})...`);
                                     await new Promise(resolve => setTimeout(resolve, 2000));
                                     const success = await this.executeCommandWithRetry(command, retryCount + 1);
                                     resolve(success);
                                 } else {
-                                    this.addMessageToChat('assistant', `❌ Command failed after ${this.maxRetries} attempts. Skipping to next step.`);
+                                    this.addMessageToChat('assistant', `❌ Command failed after ${this.maxRetries} attempts. Full output:\n${fullOutput}`);
                                     resolve(false);
                                 }
                             } else {
-                                this.terminalOutput = `${this.terminalOutput}\n$ ${command} (Terminal: ${terminalId})\n${output}\nExit code: ${actualExitCode}\n`;
-                                this.addMessageToChat('assistant', `✅ Command executed successfully in terminal ${terminalId}`);
+                                this.addMessageToChat('assistant', `✅ Command executed successfully in terminal ${terminalId}\nOutput:\n${fullOutput}`);
                                 resolve(true);
                             }
+
+                            // Cleanup temp files
+                            await Promise.all([
+                                fs.promises.unlink(outputPath).catch(() => {}),
+                                fs.promises.unlink(errorPath).catch(() => {}),
+                                fs.promises.unlink(exitCodePath).catch(() => {})
+                            ]);
+
                         } catch (error) {
-                            if (retryCount < this.maxRetries - 1) {
-                                this.addMessageToChat('assistant', `⚠️ Command failed, retrying (attempt ${retryCount + 2}/${this.maxRetries})...`);
-                                await new Promise(resolve => setTimeout(resolve, 2000));
-                                const success = await this.executeCommandWithRetry(command, retryCount + 1);
-                                resolve(success);
-                            } else {
-                                this.addMessageToChat('assistant', `❌ Command failed after ${this.maxRetries} attempts. Skipping to next step.`);
-                                resolve(false);
-                            }
+                            this.addMessageToChat('assistant', `⚠️ Error processing command output: ${error}`);
+                            resolve(false);
                         }
                     }
                 });
 
-                terminal.show(true); // true means preserve focus
-                // Wrap the command to capture its output and exit code
+                terminal.show(true);
+                
+                // Wrap command to capture both stdout and stderr separately and ensure proper completion
                 const wrappedCommand = process.platform === 'win32' 
-                    ? `${command} > %TEMP%\\${terminalId}_output 2>&1 & echo %ERRORLEVEL% > %TEMP%\\${terminalId}_exit_code & exit`
-                    : `${command} 2>&1 | tee /tmp/${terminalId}_output; echo $? > /tmp/${terminalId}_exit_code; exit`;
+                    ? `${command} > "${outputPath}" 2> "${errorPath}" & echo %ERRORLEVEL% > "${exitCodePath}" & exit`
+                    : `${command} > "${outputPath}" 2> "${errorPath}"; echo $? > "${exitCodePath}"; exit`;
+                
+                this.addMessageToChat('assistant', `🚀 Executing command in terminal ${terminalId}:\n${command}`);
                 terminal.sendText(wrappedCommand);
-
-                // Log the command start
-                this.addMessageToChat('assistant', `🚀 Started command in terminal ${terminalId}: ${command}`);
             });
         } catch (error) {
-            if (retryCount < this.maxRetries - 1) {
-                this.addMessageToChat('assistant', `⚠️ Command failed to start, retrying (attempt ${retryCount + 2}/${this.maxRetries})...`);
-                await new Promise(resolve => setTimeout(resolve, 2000));
-                return this.executeCommandWithRetry(command, retryCount + 1);
-            } else {
-                this.addMessageToChat('assistant', `❌ Command failed to start after ${this.maxRetries} attempts. Skipping to next step.`);
-                return false;
-            }
+            this.addMessageToChat('assistant', `⚠️ Error executing command: ${error}`);
+            return false;
         }
     }
 
@@ -204,14 +360,14 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
                 return;
             }
 
-            // Add user message to chat
+            // Add step timeout constant
+            const STEP_TIMEOUT_MS = 60000; // 1 minute
+
             this.addMessageToChat('user', text);
 
-            // Get included files for context
             const includedFiles = this.contextManager.getIncludedFiles();
             const excludedFiles = this.contextManager.getExcludedFiles();
 
-            // Prepare context information
             let contextInfo = '';
             if (includedFiles.length > 0) {
                 contextInfo += '\nIncluded files in context:\n' + includedFiles.join('\n');
@@ -219,15 +375,21 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
             if (excludedFiles.length > 0) {
                 contextInfo += '\nExcluded files from context:\n' + excludedFiles.join('\n');
             }
+            
+            // Always include recent terminal output in context
             if (this.terminalOutput) {
-                contextInfo += '\nRecent terminal output:\n' + this.terminalOutput;
+                contextInfo += '\nRecent terminal activity:\n' + this.terminalOutput;
             }
 
             // Stage 1: Planning Phase
             const planningInstructions = `User request: "${text}"
 
+<CURRENT_CURSOR_POSITION>
 Create a clear, step-by-step implementation plan.
-IMPORTANT: Number each step clearly as "Step 1:", "Step 2:", etc.
+IMPORTANT: 
+1. Number each step clearly as "Step 1:", "Step 2:", etc.
+2. Mark steps that contain long-running commands with [LONG-RUNNING] prefix
+3. Group related commands together in the same step
 
 Workspace context:${contextInfo}
 
@@ -235,7 +397,8 @@ Focus on:
 1-Creating the actual files and code
 2-Making it look good
 3-Making it extensive and detailed
-4-Making sure all the pathways are correct`;
+4-Making sure all the pathways are correct
+5-Properly handling errors and output from commands`;
 
             // Get plan from AI
             const planCompletion = await this.openai.chat.completions.create({
@@ -243,7 +406,7 @@ Focus on:
                 messages: [
                     { 
                         role: 'system', 
-                        content: 'You are a software development planner. Number each step clearly as "Step 1:", "Step 2:", etc. Keep steps clear and actionable.' 
+                        content: 'You are a software development planner. Number each step clearly as "Step 1:", "Step 2:", etc. Mark steps with long-running commands using [LONG-RUNNING] prefix.' 
                     },
                     { role: 'user', content: text },
                     { role: 'assistant', content: 'I will help you with that. Let me create a clear, numbered plan.' },
@@ -251,21 +414,25 @@ Focus on:
                 ],
             });
 
+            // Update token count
+            await this.updateTokenCount(planCompletion);
+
             const plan = planCompletion.choices[0].message.content || '';
             
             // Show the plan to the user
             this.addMessageToChat('assistant', '🔍 Planning Phase:\n\n' + plan);
 
             // Stage 2: Execution Phase
-            // Extract steps using a more flexible pattern
-            const stepRegex = /(?:Step\s*(\d+)[:.]\s*|^(\d+)[:.]\s*)(.*?)(?=(?:\n\s*(?:Step\s*\d+[:.]\s*|\d+[:.]\s*)|$))/gims;
-            const steps: string[] = [];
+            // Extract steps using a more flexible pattern that includes [LONG-RUNNING] prefix
+            const stepRegex = /(?:Step\s*(\d+)[:.]\s*(?:\[LONG-RUNNING\]\s*)?|^(\d+)[:.]\s*(?:\[LONG-RUNNING\]\s*)?)(.*?)(?=(?:\n\s*(?:Step\s*\d+[:.]\s*|\d+[:.]\s*)|$))/gims;
+            const steps: Array<{content: string, isLongRunning: boolean}> = [];
             let match;
 
             while ((match = stepRegex.exec(plan)) !== null) {
                 const stepContent = match[3].trim();
+                const isLongRunning = match[0].includes('[LONG-RUNNING]');
                 if (stepContent) {
-                    steps.push(stepContent);
+                    steps.push({ content: stepContent, isLongRunning });
                 }
             }
 
@@ -279,12 +446,50 @@ Focus on:
             
             for (let i = 0; i < steps.length; i++) {
                 const step = steps[i];
-                this.addMessageToChat('assistant', `📝 Step ${i + 1}/${steps.length}: ${step}`);
+                this.addMessageToChat('assistant', `📝 Step ${i + 1}/${steps.length}${step.isLongRunning ? ' [LONG-RUNNING]' : ''}: ${step.content}`);
 
-                // Prepare execution instructions for this step
-                const executionInstructions = `Original user request: "${text}"
+                // Create a promise that rejects after timeout
+                const timeoutPromise = new Promise((_, reject) => {
+                    setTimeout(() => reject(new Error('Step timeout')), STEP_TIMEOUT_MS);
+                });
 
-Current step to implement: ${step}
+                try {
+                    // Race between step execution and timeout
+                    await Promise.race([
+                        this.executeStep(step, text, contextInfo, i),
+                        timeoutPromise
+                    ]);
+                } catch (error: unknown) {
+                    if (error instanceof Error && error.message === 'Step timeout') {
+                        this.addMessageToChat('assistant', `⚠️ Step ${i + 1} took too long (>1 minute). Moving to next step...`);
+                    } else {
+                        this.addMessageToChat('assistant', `❌ Error in step ${i + 1}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+                    }
+                    // Continue to next step regardless of error
+                    continue;
+                }
+
+                // Add a small delay between steps for better visibility
+                if (i < steps.length - 1) {
+                    this.addMessageToChat('assistant', `⏳ Transitioning to step ${i + 2}...`);
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+            }
+
+            // Final completion message
+            this.addMessageToChat('assistant', '🎉 All steps have been completed!');
+        } catch (error) {
+            vscode.window.showErrorMessage(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+            this.addMessageToChat('assistant', '❌ An error occurred while processing your request.');
+        }
+    }
+
+    private async executeStep(step: {content: string, isLongRunning: boolean}, text: string, contextInfo: string, stepIndex: number): Promise<void> {
+        // Prepare execution instructions for this step WITH full context
+        const executionInstructions = `Original user request: "${text}"
+
+Current step to implement: ${step.content}
+Step type: ${step.isLongRunning ? 'LONG-RUNNING' : 'REGULAR'}
 
 Requirements:
 1. FIRST create all necessary files using ### filename.ext markers
@@ -301,126 +506,95 @@ content
 
 Workspace context:${contextInfo}`;
 
-                // Get implementation from AI
-                const executionCompletion = await this.openai.chat.completions.create({
-                    model: 'o3-mini',
-                    messages: [
-                        { 
-                            role: 'system', 
-                            content: 'You are a software developer. ALWAYS create necessary files before suggesting any commands. Never suggest commands without creating the required files first.' 
-                        },
-                        { role: 'user', content: text },
-                        { role: 'assistant', content: 'I will help implement this step of your request.' },
-                        { role: 'user', content: executionInstructions }
-                    ]
-                });
+        // Get implementation from AI with full context
+        const executionCompletion = await this.openai.chat.completions.create({
+            model: 'o3-mini',
+            messages: [
+                { 
+                    role: 'system', 
+                    content: 'You are a software developer. Create ONE file at a time and execute ONE command at a time. Always wait for each operation to complete before starting the next.' 
+                },
+                { role: 'user', content: text },
+                { role: 'assistant', content: 'I will help implement this step of your request.' },
+                { role: 'user', content: executionInstructions }
+            ]
+        });
 
-                const implementation = executionCompletion.choices[0].message.content || '';
-                
-                // First check if there are any file markers
-                if (!implementation.includes('### ')) {
-                    this.addMessageToChat('assistant', '⚠️ No files were specified for creation. Skipping this step as file creation is required.');
-                    continue;
-                }
+        // Update token count
+        await this.updateTokenCount(executionCompletion);
 
-                // Process file creation markers
-                let filesCreated = false;
-                try {
-                    await this.processFileCreationMarkers(implementation);
-                    filesCreated = true;
-                    this.addMessageToChat('assistant', '✅ Files created successfully');
-                } catch (error) {
-                    this.addMessageToChat('assistant', `❌ Error creating files: ${error instanceof Error ? error.message : 'Unknown error'}`);
-                    continue; // Skip to next step if file creation fails
-                }
-
-                // Only process commands if files were created successfully
-                if (filesCreated) {
-                    const commandRegex = /\$ (.*)/g;
-                    const commands = [...implementation.matchAll(commandRegex)].map(match => match[1]);
-                    
-                    if (commands.length > 0) {
-                        this.addMessageToChat('assistant', '⚡ Executing commands after successful file creation:');
-                        // Execute commands in parallel within the same step
-                        const results = await Promise.all(commands.map(async command => {
-                            this.addMessageToChat('assistant', `📝 Starting: ${command}`);
-                            return {
-                                command,
-                                success: await this.executeCommandWithRetry(command)
-                            };
-                        }));
-
-                        // Check if any command failed
-                        if (results.some(r => !r.success)) {
-                            const failedCommands = results.filter(r => !r.success).map(r => r.command);
-                            this.addMessageToChat('assistant', `⚠️ Some commands failed: ${failedCommands.join(', ')}`);
-                            continue; // Skip to next step if any command failed
-                        }
-                    }
-                }
-
-                // Show completion for this step
-                this.addMessageToChat('assistant', `✅ Completed step ${i + 1}/${steps.length}`);
-            }
-
-            // Final completion message
-            this.addMessageToChat('assistant', '🎉 All steps have been completed successfully!');
-        } catch (error) {
-            vscode.window.showErrorMessage(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
-            this.addMessageToChat('assistant', '❌ An error occurred while processing your request.');
-        }
-    }
-
-    private async processFileCreationMarkers(text: string) {
+        const implementation = executionCompletion.choices[0].message.content || '';
+        
+        // Extract all file creation markers and commands
         const fileRegex = /###\s*([^\n]+)\s*\n([\s\S]*?)%%%/g;
-        let match;
+        const commandRegex = /\$ (.*)/g;
+        
+        const files = [...implementation.matchAll(fileRegex)].map(match => ({
+            path: match[1].trim(),
+            content: match[2].trim()
+        }));
+        
+        const commands = [...implementation.matchAll(commandRegex)].map(match => match[1]);
 
-        while ((match = fileRegex.exec(text)) !== null) {
-            const [_, filePath, content] = match;
-            // Clean up the content by removing markdown code block markers
-            const cleanContent = content
-                .trim()
-                .replace(/^```[\w-]*\n/gm, '') // Remove opening code block markers
-                .replace(/```$/gm, '')         // Remove closing code block markers
-                .replace(/^`{1,2}[\w-]*\n/gm, '') // Remove inline code markers
-                .replace(/`{1,2}$/gm, '')         // Remove closing inline code markers
-                .trim();
-            
-            await this.createFile(filePath.trim(), cleanContent);
+        // Process files one at a time
+        for (const file of files) {
+            this.addMessageToChat('assistant', `📝 Creating file: ${file.path}`);
+            try {
+                await this.createFile(file.path, file.content);
+                // Add a small delay after file creation
+                await new Promise(resolve => setTimeout(resolve, 500));
+            } catch (error) {
+                this.addMessageToChat('assistant', `❌ Error creating file ${file.path}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+                return;
+            }
         }
+
+        // Process commands one at a time
+        if (commands.length > 0) {
+            for (const command of commands) {
+                this.addMessageToChat('assistant', `⚡ Executing command: ${command}`);
+                const success = await this.executeCommandWithRetry(command);
+                
+                if (!success && !step.isLongRunning) {
+                    this.addMessageToChat('assistant', `❌ Command failed: ${command}`);
+                    return;
+                }
+                
+                // Add a delay between commands
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+        }
+
+        this.addMessageToChat('assistant', `✅ Step ${stepIndex + 1} completed`);
     }
 
     private async createFile(filePath: string, content: string) {
-        try {
-            if (!vscode.workspace.workspaceFolders) {
-                throw new Error('No workspace folder is open');
-            }
+        if (!vscode.workspace.workspaceFolders) {
+            throw new Error('No workspace folder is open');
+        }
 
-            const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
-            const fullPath = path.join(workspaceRoot, filePath);
+        const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
+        const fullPath = path.join(workspaceRoot, filePath);
 
-            // Create directory if it doesn't exist
-            await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
+        // Create directory if it doesn't exist
+        await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
 
-            // Write file content
-            await fs.promises.writeFile(fullPath, content);
+        // Write file content
+        await fs.promises.writeFile(fullPath, content);
 
-            // Automatically include the new file in context
-            await this.contextManager.includeFile(filePath);
+        // Automatically include the new file in context
+        await this.contextManager.includeFile(filePath);
 
-            // Show success message
-            vscode.window.showInformationMessage(`Created and included file: ${filePath}`);
+        // Show success message
+        this.addMessageToChat('assistant', `✅ Created file: ${filePath}`);
 
-            // Open the file in editor
-            const document = await vscode.workspace.openTextDocument(fullPath);
-            await vscode.window.showTextDocument(document);
+        // Open the file in editor (one at a time)
+        const document = await vscode.workspace.openTextDocument(fullPath);
+        await vscode.window.showTextDocument(document, { preview: true });
 
-            // Update the file tree view to show the new file with blue dot
-            if (this.fileViewProvider) {
-                await this.fileViewProvider.updateFileList();
-            }
-        } catch (error) {
-            vscode.window.showErrorMessage(`Failed to create file ${filePath}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        // Update the file tree view
+        if (this.fileViewProvider) {
+            await this.fileViewProvider.updateFileList();
         }
     }
 
@@ -771,9 +945,216 @@ console.log(greeting);
         this.activeTerminals.clear();
     }
 
-    // Update deactivate to clean up terminals
+    // Update deactivate to clean up terminals and save token counts
     public deactivate() {
         this.cleanupTerminals();
+        if (this.tokenCountPanel) {
+            this.tokenCountPanel.dispose();
+        }
+        // Save final token counts
+        this._extensionContext.globalState.update('tokenCount', this.tokenCount);
+    }
+
+    private async handleCommandFailure(command: string, error: string, output: string): Promise<boolean> {
+        try {
+            this.addMessageToChat('assistant', '🔍 Analyzing command failure and attempting recovery...');
+            
+            // Comprehensive error analysis instructions with FULL error context
+            const errorAnalysisInstructions = `
+Command failed: "${command}"
+Error message: "${error}"
+Error output: "${output}"
+Full output: "${output}"
+
+Analyze the error and suggest a solution. If code changes are needed, specify them using the following format:
+
+For file modifications:
+EDIT_FILE: filename
+START_BLOCK: [unique identifier or line number]
+[new code]
+END_BLOCK
+
+For new files:
+### filename.ext
+content
+%%%
+
+For commands:
+$ command
+
+Focus on:
+1. Understanding the root cause of the error
+2. Suggesting specific fixes
+3. Providing step-by-step recovery instructions`;
+
+            const errorAnalysis = await this.openai.chat.completions.create({
+                model: 'o3-mini',
+                messages: [
+                    { 
+                        role: 'system', 
+                        content: 'You are an error analysis and recovery expert. Analyze command failures and suggest specific solutions.' 
+                    },
+                    { role: 'user', content: errorAnalysisInstructions }
+                ]
+            });
+
+            // Update token count
+            await this.updateTokenCount(errorAnalysis);
+
+            const solution = errorAnalysis.choices[0].message.content || '';
+            this.addMessageToChat('assistant', '💡 Suggested recovery plan:\n' + solution);
+
+            let recoverySuccessful = false;
+
+            // Process file edits first
+            const editMatches = solution.match(/EDIT_FILE:\s*([^\n]+)\nSTART_BLOCK:\s*([^\n]+)\n([\s\S]*?)\nEND_BLOCK/g);
+            if (editMatches) {
+                for (const match of editMatches) {
+                    const [_, file, blockId, newCode] = match.match(/EDIT_FILE:\s*([^\n]+)\nSTART_BLOCK:\s*([^\n]+)\n([\s\S]*?)\nEND_BLOCK/) || [];
+                    if (file && blockId && newCode) {
+                        try {
+                            await this.editFileBlock(file, blockId, newCode.trim());
+                            recoverySuccessful = true;
+                        } catch (error) {
+                            this.addMessageToChat('assistant', `⚠️ Failed to edit ${file}: ${error}`);
+                            // Continue with other recovery methods
+                        }
+                    }
+                }
+            }
+
+            // Process new file creation
+            try {
+                await this.processFileCreationMarkers(solution);
+                recoverySuccessful = true;
+            } catch (error) {
+                this.addMessageToChat('assistant', `⚠️ Failed to create new files: ${error}`);
+                // Continue with recovery commands
+            }
+
+            // Process recovery commands
+            const commandRegex = /\$ (.*)/g;
+            const recoveryCommands = [...solution.matchAll(commandRegex)].map(match => match[1]);
+            
+            if (recoveryCommands.length > 0) {
+                this.addMessageToChat('assistant', '🔧 Executing recovery commands:');
+                const results = await Promise.all(recoveryCommands.map(async cmd => {
+                    if (cmd === command) {
+                        this.addMessageToChat('assistant', `⚠️ Skipping original failed command to prevent loop: ${cmd}`);
+                        return { command: cmd, success: false };
+                    }
+                    this.addMessageToChat('assistant', `📝 Running: ${cmd}`);
+                    return {
+                        command: cmd,
+                        success: await this.executeCommandWithRetry(cmd)
+                    };
+                }));
+
+                // Check if any recovery command succeeded
+                if (results.some(r => r.success)) {
+                    recoverySuccessful = true;
+                }
+            }
+
+            if (recoverySuccessful) {
+                this.addMessageToChat('assistant', '✅ Recovery steps completed successfully');
+                return true;
+            }
+
+            this.addMessageToChat('assistant', '❌ Recovery steps failed to resolve the issue');
+            return false;
+        } catch (error) {
+            this.addMessageToChat('assistant', `❌ Error during recovery: ${error}`);
+            return false;
+        }
+    }
+
+    private async editFileBlock(filePath: string, blockIdentifier: string, newCode: string) {
+        try {
+            if (!vscode.workspace.workspaceFolders) {
+                throw new Error('No workspace folder is open');
+            }
+
+            const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
+            const fullPath = path.join(workspaceRoot, filePath);
+
+            // Verify file exists
+            if (!fs.existsSync(fullPath)) {
+                throw new Error(`File does not exist: ${filePath}`);
+            }
+
+            // Read existing file content
+            const content = await fs.promises.readFile(fullPath, 'utf8');
+            let newContent = content;
+            let edited = false;
+
+            // Try to identify the block
+            if (blockIdentifier.match(/^\d+$/)) {
+                // Line number based replacement
+                const lines = content.split('\n');
+                const lineNum = parseInt(blockIdentifier, 10);
+                if (lineNum > 0 && lineNum <= lines.length) {
+                    if (lines[lineNum - 1] === newCode) {
+                        this.addMessageToChat('assistant', `⚠️ No changes needed for line ${lineNum} in ${filePath}`);
+                        return;
+                    }
+                    lines[lineNum - 1] = newCode;
+                    newContent = lines.join('\n');
+                    edited = true;
+                } else {
+                    throw new Error(`Invalid line number ${lineNum} for file ${filePath}`);
+                }
+            } else {
+                // Block identifier based replacement
+                const blockRegex = new RegExp(`// BEGIN ${blockIdentifier}[\\s\\S]*?// END ${blockIdentifier}`, 'g');
+                const newBlock = `// BEGIN ${blockIdentifier}\n${newCode}\n// END ${blockIdentifier}`;
+                
+                if (!content.match(blockRegex)) {
+                    throw new Error(`Block "${blockIdentifier}" not found in ${filePath}`);
+                }
+
+                const updatedContent = content.replace(blockRegex, newBlock);
+                if (updatedContent === content) {
+                    this.addMessageToChat('assistant', `⚠️ No changes needed for block "${blockIdentifier}" in ${filePath}`);
+                    return;
+                }
+                newContent = updatedContent;
+                edited = true;
+            }
+
+            if (edited) {
+                // Write updated content
+                await fs.promises.writeFile(fullPath, newContent);
+                
+                // Show success message
+                this.addMessageToChat('assistant', `✅ Updated ${blockIdentifier} in ${filePath}`);
+
+                // Open the file in editor
+                const document = await vscode.workspace.openTextDocument(fullPath);
+                await vscode.window.showTextDocument(document);
+            }
+        } catch (error) {
+            throw new Error(`Failed to edit file ${filePath}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+    }
+
+    private async processFileCreationMarkers(text: string) {
+        const fileRegex = /###\s*([^\n]+)\s*\n([\s\S]*?)%%%/g;
+        let match;
+
+        while ((match = fileRegex.exec(text)) !== null) {
+            const [_, filePath, content] = match;
+            // Clean up the content by removing markdown code block markers
+            const cleanContent = content
+                .trim()
+                .replace(/^```[\w-]*\n/gm, '') // Remove opening code block markers
+                .replace(/```$/gm, '')         // Remove closing code block markers
+                .replace(/^`{1,2}[\w-]*\n/gm, '') // Remove inline code markers
+                .replace(/`{1,2}$/gm, '')         // Remove closing inline code markers
+                .trim();
+            
+            await this.createFile(filePath.trim(), cleanContent);
+        }
     }
 }
 
@@ -970,8 +1351,6 @@ class FileViewProvider implements vscode.WebviewViewProvider {
                         --card-border: var(--vscode-panel-border);
                         --accent-color: #0098ff;
                         --accent-color-light: #0098ff33;
-                        --warning-color: #ff8c00;
-                        --warning-color-light: #ff8c0033;
                     }
 
                     body {

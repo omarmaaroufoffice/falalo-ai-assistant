@@ -144,23 +144,29 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
             }
 
             // Stage 1: Planning Phase
-            const planningInstructions = `Analyze this request and provide a clear, direct implementation plan:
-${text}
+            const planningInstructions = `User request: "${text}"
+
+Create a clear, step-by-step implementation plan.
+IMPORTANT: Number each step clearly as "Step 1:", "Step 2:", etc.
 
 Workspace context:${contextInfo}
 
 Focus on:
-1. Dependencies and versions
-2. File operations and paths
-3. Code changes
-4. Testing requirements
-5. Security considerations`;
+1-Creating the actual files and code
+2-Making it look good
+3-Making it extensive and detailed
+4-Making sure all the pathways are correct`;
 
             // Get plan from AI
             const planCompletion = await this.openai.chat.completions.create({
                 model: 'o3-mini',
                 messages: [
-                    { role: 'system', content: 'You are a software development planner. Provide clear, actionable steps.' },
+                    { 
+                        role: 'system', 
+                        content: 'You are a software development planner. Number each step clearly as "Step 1:", "Step 2:", etc. Keep steps clear and actionable.' 
+                    },
+                    { role: 'user', content: text },
+                    { role: 'assistant', content: 'I will help you with that. Let me create a clear, numbered plan.' },
                     { role: 'user', content: planningInstructions }
                 ],
             });
@@ -171,34 +177,47 @@ Focus on:
             this.addMessageToChat('assistant', '🔍 Planning Phase:\n\n' + plan);
 
             // Stage 2: Execution Phase
-            // Extract only the numbered steps from the plan
-            const steps = plan.split('\n')
-                .filter(line => /^\d+\./.test(line))
-                .map(step => step.trim());
+            // Extract steps using a more flexible pattern
+            const stepRegex = /(?:Step\s*(\d+)[:.]\s*|^(\d+)[:.]\s*)(.*?)(?=(?:\n\s*(?:Step\s*\d+[:.]\s*|\d+[:.]\s*)|$))/gims;
+            const steps: string[] = [];
+            let match;
+
+            while ((match = stepRegex.exec(plan)) !== null) {
+                const stepContent = match[3].trim();
+                if (stepContent) {
+                    steps.push(stepContent);
+                }
+            }
 
             if (steps.length === 0) {
-                this.addMessageToChat('assistant', '❌ No actionable steps were found in the plan.');
-            return;
-        }
+                this.addMessageToChat('assistant', '❌ No actionable steps were found in the plan. Let me try again with a clearer format.');
+                return;
+            }
 
             // Show total number of steps
-            this.addMessageToChat('assistant', `🚀 Executing ${steps.length} steps...`);
+            this.addMessageToChat('assistant', `🚀 Found ${steps.length} steps to execute...`);
             
             for (let i = 0; i < steps.length; i++) {
                 const step = steps[i];
                 this.addMessageToChat('assistant', `📝 Step ${i + 1}/${steps.length}: ${step}`);
 
                 // Prepare execution instructions for this step
-                const executionInstructions = `Implement this step with production-ready code:
-${step}
+                const executionInstructions = `Original user request: "${text}"
+
+Current step to implement: ${step}
 
 Requirements:
-- Include imports and dependencies
-- Add error handling and logging
-- Use TypeScript types
-- Follow security practices
+1. FIRST create all necessary files using ### filename.ext markers
+2. Include all required code, imports, and dependencies in the files
+3. Only after creating files, specify any necessary commands with $ prefix
+4. Use TypeScript/JavaScript where possible
+5. Add error handling and logging
+6. Follow security practices
 
-Use ### filename for new files and $ for commands.
+File Creation Format:
+### filename.ext
+content
+%%%
 
 Workspace context:${contextInfo}`;
 
@@ -206,31 +225,57 @@ Workspace context:${contextInfo}`;
                 const executionCompletion = await this.openai.chat.completions.create({
                     model: 'o3-mini',
                     messages: [
-                        { role: 'system', content: 'You are a software developer. Implement tasks with complete, production-ready code.' },
+                        { 
+                            role: 'system', 
+                            content: 'You are a software developer. ALWAYS create necessary files before suggesting any commands. Never suggest commands without creating the required files first.' 
+                        },
+                        { role: 'user', content: text },
+                        { role: 'assistant', content: 'I will help implement this step of your request.' },
                         { role: 'user', content: executionInstructions }
-                    ],
+                    ]
                 });
 
                 const implementation = executionCompletion.choices[0].message.content || '';
-
-                // Process any file creation markers in the implementation
-                await this.processFileCreationMarkers(implementation);
                 
-                // Execute any commands in the implementation
-                const commandRegex = /\$ (.*)/g;
-                const commands = [...implementation.matchAll(commandRegex)].map(match => match[1]);
-                for (const command of commands) {
-                    try {
-                        const terminal = vscode.window.createTerminal('Falalo Execution');
-                        terminal.sendText(command);
-                        terminal.show();
-                        await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for command to start
-                    } catch (error) {
-                        this.addMessageToChat('assistant', `❌ Error executing command: ${command}\nError: ${error instanceof Error ? error.message : 'Unknown error'}`);
+                // First check if there are any file markers
+                if (!implementation.includes('### ')) {
+                    this.addMessageToChat('assistant', '⚠️ No files were specified for creation. Skipping this step as file creation is required.');
+                    continue;
+                }
+
+                // Process file creation markers
+                let filesCreated = false;
+                try {
+                    await this.processFileCreationMarkers(implementation);
+                    filesCreated = true;
+                    this.addMessageToChat('assistant', '✅ Files created successfully');
+                } catch (error) {
+                    this.addMessageToChat('assistant', `❌ Error creating files: ${error instanceof Error ? error.message : 'Unknown error'}`);
+                    continue; // Skip to next step if file creation fails
+                }
+
+                // Only process commands if files were created successfully
+                if (filesCreated) {
+                    const commandRegex = /\$ (.*)/g;
+                    const commands = [...implementation.matchAll(commandRegex)].map(match => match[1]);
+                    
+                    if (commands.length > 0) {
+                        this.addMessageToChat('assistant', '⚡ Executing commands after successful file creation:');
+                        for (const command of commands) {
+                            try {
+                                const terminal = vscode.window.createTerminal('Falalo Execution');
+                                terminal.sendText(command);
+                                terminal.show();
+                                this.addMessageToChat('assistant', `📝 Running: ${command}`);
+                                await new Promise(resolve => setTimeout(resolve, 2000));
+                            } catch (error) {
+                                this.addMessageToChat('assistant', `❌ Error executing command: ${command}\nError: ${error instanceof Error ? error.message : 'Unknown error'}`);
+                            }
+                        }
                     }
                 }
 
-                // Show the implementation
+                // Show completion for this step
                 this.addMessageToChat('assistant', `✅ Completed step ${i + 1}/${steps.length}`);
             }
 

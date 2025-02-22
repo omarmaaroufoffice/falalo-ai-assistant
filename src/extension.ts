@@ -139,44 +139,35 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
             // Prepare the message with file creation instructions and context
             const aiInstructions = `You have the following context about the workspace:${contextInfo}
 
-When responding with code or file content:
-1. First provide your normal response with any explanations and code blocks
-2. AFTER your response, if files need to be created, add them using this format:
+IMPORTANT: When creating files, follow these rules exactly:
+1. First provide your normal response with explanations
+2. Then, for each file you want to create:
+   - Start with "###" followed by the filename on its own line
+   - Put the EXACT file content on the next line(s) WITHOUT any markdown formatting
+   - End with "%%%" on its own line
+   - Leave one blank line between multiple files
 
-- Start each file section with "###" followed by the filename
-- Put the file content on the next line
-- End with "%%%" on its own line
-- Leave one blank line between multiple files
+Example of correct file creation format:
 
-For example, your response should look like this:
+I'll create a Python script that does X and Y.
 
-Here's a simple HTML page that does X and Y...
-
-\`\`\`html
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Example</title>
-</head>
-<body>
-    <h1>Hello</h1>
-</body>
-</html>
-\`\`\`
-
-I'll create this file for you:
-
-### index.html
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Example</title>
-</head>
-<body>
-    <h1>Hello</h1>
-</body>
-</html>
+### example.py
+def main():
+    print("Hello, World!")
+    
+if __name__ == "__main__":
+    main()
 %%%
+
+### styles.css
+.button {
+    color: blue;
+    padding: 10px;
+}
+%%%
+
+DO NOT include any markdown formatting (like \`\`\`python) around the file content.
+The content between ### and %%% should be exactly what will be written to the file.
 
 Now, please respond to the following request:
 
@@ -204,7 +195,16 @@ ${text}`;
 
         while ((match = fileRegex.exec(text)) !== null) {
             const [_, filePath, content] = match;
-            await this.createFile(filePath.trim(), content.trim());
+            // Clean up the content by removing markdown code block markers
+            const cleanContent = content
+                .trim()
+                .replace(/^```[\w-]*\n/gm, '') // Remove opening code block markers
+                .replace(/```$/gm, '')         // Remove closing code block markers
+                .replace(/^`{1,2}[\w-]*\n/gm, '') // Remove inline code markers
+                .replace(/`{1,2}$/gm, '')         // Remove closing inline code markers
+                .trim();
+            
+            await this.createFile(filePath.trim(), cleanContent);
         }
     }
 
@@ -371,26 +371,31 @@ ${text}`;
                         <div class="help-toggle" id="helpToggle">Show file creation format help</div>
                         <div class="file-format-help" id="fileFormatHelp" style="display: none;">
                             <strong>File Creation Format:</strong>
-                            <p>To create files, use the following format in your request:</p>
+                            <p>To create files, use this exact format:</p>
                             <pre>### filename.ext
-file content here
+EXACT file content here (no markdown formatting)
 %%%</pre>
                             <p>Example:</p>
-                            <pre>### src/components/Button.tsx
-import React from 'react';
-
-export const Button = () => {
-    return <button>Click me</button>;
-}
+                            <pre>### src/hello.py
+def main():
+    print("Hello, World!")
+    
+if __name__ == "__main__":
+    main()
 %%%</pre>
-                            <p>You can create multiple files by using multiple blocks:</p>
+                            <p>For multiple files:</p>
                             <pre>### file1.js
-console.log('Hello');
+const greeting = "Hello";
+console.log(greeting);
 %%%
 
 ### file2.css
-.button { color: blue; }
+.button {
+    color: blue;
+    padding: 10px;
+}
 %%%</pre>
+                            <p><strong>Important:</strong> Do not add any markdown formatting around the file content. The content between ### and %%% will be written to the file exactly as is.</p>
                         </div>
                         <div class="input-row">
                             <textarea id="userInput" placeholder="Type your message... Use ### filename.ext to start a file and %%% to end it"></textarea>

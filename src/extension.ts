@@ -232,7 +232,7 @@ You have the following context about the workspace:${contextInfo}
 Please implement this step now with complete, production-ready code.`;
 
                 // Get implementation from AI
-                const executionModel = this.genAI.getGenerativeModel({ model: 'gemin-2.0-flash' });
+                const executionModel = this.genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
                 const executionResult = await executionModel.generateContent(executionInstructions);
                 const implementation = executionResult.response.text();
                 

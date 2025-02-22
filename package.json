@@ -102,10 +102,10 @@
           ],
           "description": "Glob patterns for files to exclude from context"
         },
-        "falalo.googleApiKey": {
+        "falalo.openaiApiKey": {
           "type": "string",
           "default": "",
-          "description": "Google AI API Key for the chat functionality"
+          "description": "OpenAI API Key for the chat functionality"
         }
       }
     }
@@ -139,9 +139,8 @@
     "webpack-cli": "^5.1.1"
   },
   "dependencies": {
-    "@google/generative-ai": "^0.1.0",
+    "openai": "^4.0.0",
     "glob": "^10.2.7",
-    "google-auth-library": "^9.0.0",
     "minimatch": "^9.0.0"
   },
   "keywords": [

@@ -1,6 +1,5 @@
 import * as vscode from 'vscode';
-import { GoogleAuth } from 'google-auth-library';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import OpenAI from 'openai';
 import * as glob from 'glob';
 import { minimatch } from 'minimatch';
 import * as fs from 'fs';
@@ -77,7 +76,7 @@ class ContextManager {
 class ChatViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'falaloChat';
     private _view?: vscode.WebviewView;
-    private genAI: GoogleGenerativeAI;
+    private openai: OpenAI;
     private fileViewProvider?: FileViewProvider;
 
     constructor(
@@ -86,8 +85,11 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
         private readonly contextManager: ContextManager
     ) {
         const config = vscode.workspace.getConfiguration('falalo');
-        const apiKey = config.get('googleApiKey', '');
-        this.genAI = new GoogleGenerativeAI(apiKey);
+        const apiKey = config.get('openaiApiKey', '');
+        this.openai = new OpenAI({
+            apiKey: apiKey,
+            dangerouslyAllowBrowser: true
+        });
     }
 
     public setFileViewProvider(provider: FileViewProvider) {
@@ -122,8 +124,8 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     private async handleUserMessage(text: string) {
         try {
             if (!this._view) {
-            return;
-        }
+                return;
+            }
 
             // Add user message to chat
             this.addMessageToChat('user', text);
@@ -142,109 +144,98 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
             }
 
             // Stage 1: Planning Phase
-            const planningInstructions = `You are a planning AI. Your role is to:
-1. Analyze the user's request and break it down into specific, actionable steps
-2. Each step should be clear, achievable, and highly detailed
-3. Steps should be in logical order with clear dependencies
-4. Include all necessary prerequisites, including:
-   - Required dependencies and versions
-   - Environment setup
-   - Configuration files
-   - Directory structure
-5. Format your response as a numbered list
-6. Be extremely specific about:
-   - File operations and exact paths
-   - Code changes with full context
-   - Package management
-   - Testing requirements
-   - Error handling
-   - Documentation needs
-7. Consider cross-platform compatibility
-8. Include security best practices
-9. Plan for proper error handling and validation
-10. Include necessary TypeScript types and interfaces
-11. Consider performance implications
-12. Plan for proper documentation (JSDoc, README updates)
+            const planningInstructions = `Analyze this request and provide a clear, direct implementation plan:
+${text}
 
-Remember to make all code extensive, detailed, and production-ready with:
-- Complete error handling
-- Comprehensive input validation
-- Proper TypeScript types
-- Detailed comments and documentation
-- Best practices for performance
-- Security considerations
-- Cross-platform compatibility
-- Proper testing setup
+Workspace context:${contextInfo}
 
-You have the following context about the workspace:${contextInfo}
-
-Please analyze this request and provide a detailed step-by-step plan:
-${text}`;
+Focus on:
+1. Dependencies and versions
+2. File operations and paths
+3. Code changes
+4. Testing requirements
+5. Security considerations`;
 
             // Get plan from AI
-            const planningModel = this.genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
-            const planResult = await planningModel.generateContent(planningInstructions);
-            const plan = planResult.response.text();
+            const planCompletion = await this.openai.chat.completions.create({
+                model: 'o3-mini',
+                messages: [
+                    { role: 'system', content: 'You are a software development planner. Provide clear, actionable steps.' },
+                    { role: 'user', content: planningInstructions }
+                ],
+            });
+
+            const plan = planCompletion.choices[0].message.content || '';
             
             // Show the plan to the user
             this.addMessageToChat('assistant', '🔍 Planning Phase:\n\n' + plan);
 
             // Stage 2: Execution Phase
-            const steps = plan.split('\n').filter(line => /^\d+\./.test(line));
-            
-            for (const step of steps) {
-                // Prepare execution instructions for each step
-                const executionInstructions = `You are an execution AI. Your role is to implement the following step with extensive, production-ready code:
+            // Extract only the numbered steps from the plan
+            const steps = plan.split('\n')
+                .filter(line => /^\d+\./.test(line))
+                .map(step => step.trim());
 
+            if (steps.length === 0) {
+                this.addMessageToChat('assistant', '❌ No actionable steps were found in the plan.');
+            return;
+        }
+
+            // Show total number of steps
+            this.addMessageToChat('assistant', `🚀 Executing ${steps.length} steps...`);
+            
+            for (let i = 0; i < steps.length; i++) {
+                const step = steps[i];
+                this.addMessageToChat('assistant', `📝 Step ${i + 1}/${steps.length}: ${step}`);
+
+                // Prepare execution instructions for this step
+                const executionInstructions = `Implement this step with production-ready code:
 ${step}
 
-When implementing code:
-1. Write COMPLETE, EXTENSIVE, and DETAILED implementations
-2. Include ALL necessary imports and dependencies
-3. Add comprehensive error handling
-4. Include detailed TypeScript types and interfaces
-5. Add extensive JSDoc documentation
-6. Implement proper input validation
-7. Follow security best practices
-8. Consider cross-platform compatibility
-9. Add detailed comments explaining complex logic
-10. Include logging for important operations
-11. Implement proper error messages
-12. Consider performance optimizations
-13. Add necessary unit tests
-14. Update relevant documentation
+Requirements:
+- Include imports and dependencies
+- Add error handling and logging
+- Use TypeScript types
+- Follow security practices
 
-When creating files, follow these rules exactly:
-1. Start with "###" followed by the filename on its own line
-2. Put the EXACT file content on the next line(s) WITHOUT any markdown formatting
-3. End with "%%%" on its own line
-4. Leave one blank line between multiple files
-5. Include ALL necessary files (configs, types, tests, etc.)
-6. Add detailed comments and documentation
-7. Include complete error handling
-8. Add proper TypeScript types
-9. Include necessary package.json updates
+Use ### filename for new files and $ for commands.
 
-NEVER write placeholder code or TODO comments. Always implement FULL, COMPLETE, and PRODUCTION-READY code.
-
-You have the following context about the workspace:${contextInfo}
-
-Please implement this step now with complete, production-ready code.`;
+Workspace context:${contextInfo}`;
 
                 // Get implementation from AI
-                const executionModel = this.genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
-                const executionResult = await executionModel.generateContent(executionInstructions);
-                const implementation = executionResult.response.text();
-                
-                // Show the implementation
-                this.addMessageToChat('assistant', `📝 Executing Step: ${step}\n\n${implementation}`);
+                const executionCompletion = await this.openai.chat.completions.create({
+                    model: 'o3-mini',
+                    messages: [
+                        { role: 'system', content: 'You are a software developer. Implement tasks with complete, production-ready code.' },
+                        { role: 'user', content: executionInstructions }
+                    ],
+                });
+
+                const implementation = executionCompletion.choices[0].message.content || '';
 
                 // Process any file creation markers in the implementation
                 await this.processFileCreationMarkers(implementation);
+                
+                // Execute any commands in the implementation
+                const commandRegex = /\$ (.*)/g;
+                const commands = [...implementation.matchAll(commandRegex)].map(match => match[1]);
+                for (const command of commands) {
+                    try {
+                        const terminal = vscode.window.createTerminal('Falalo Execution');
+                        terminal.sendText(command);
+                        terminal.show();
+                        await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for command to start
+                    } catch (error) {
+                        this.addMessageToChat('assistant', `❌ Error executing command: ${command}\nError: ${error instanceof Error ? error.message : 'Unknown error'}`);
+                    }
+                }
+
+                // Show the implementation
+                this.addMessageToChat('assistant', `✅ Completed step ${i + 1}/${steps.length}`);
             }
 
             // Final completion message
-            this.addMessageToChat('assistant', '✅ All steps have been completed with full implementation!');
+            this.addMessageToChat('assistant', '🎉 All steps have been completed successfully!');
         } catch (error) {
             vscode.window.showErrorMessage(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
             this.addMessageToChat('assistant', '❌ An error occurred while processing your request.');

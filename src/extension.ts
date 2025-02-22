@@ -273,102 +273,226 @@ Please implement this step now.`;
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <title>Falalo AI Chat</title>
                 <style>
+                    :root {
+                        --card-bg: var(--vscode-editor-background);
+                        --card-border: var(--vscode-panel-border);
+                        --accent-color: #0098ff;
+                        --accent-color-light: #0098ff33;
+                        --warning-color: #ff8c00;
+                        --warning-color-light: #ff8c0033;
+                        --success-color: #28a745;
+                        --error-color: #dc3545;
+                    }
+
                     body {
-                        padding: 10px;
+                        padding: 16px;
                         color: var(--vscode-editor-foreground);
                         background-color: var(--vscode-editor-background);
                         display: flex;
                         flex-direction: column;
                         height: 100vh;
                         margin: 0;
+                        font-family: var(--vscode-font-family);
+                        line-height: 1.5;
                     }
+
                     .chat-container {
                         display: flex;
                         flex-direction: column;
                         height: 100%;
+                        gap: 16px;
                     }
+
                     .messages {
                         flex-grow: 1;
                         overflow-y: auto;
                         margin-bottom: 10px;
-                        padding-right: 5px;
+                        padding-right: 8px;
+                        scroll-behavior: smooth;
                     }
+
                     .message {
-                        margin: 5px 0;
-                        padding: 8px;
-                        border-radius: 4px;
-                        max-width: 95%;
+                        margin: 12px 0;
+                        max-width: 85%;
                         word-wrap: break-word;
+                        animation: fadeIn 0.3s ease-in-out;
                     }
+
+                    @keyframes fadeIn {
+                        from { opacity: 0; transform: translateY(10px); }
+                        to { opacity: 1; transform: translateY(0); }
+                    }
+
+                    .message-content {
+                        padding: 12px 16px;
+                        border-radius: 12px;
+                        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+                        position: relative;
+                    }
+
                     .user-message {
-                        background-color: var(--vscode-editor-selectionBackground);
                         margin-left: auto;
                     }
+
+                    .user-message .message-content {
+                        background-color: var(--accent-color);
+                        color: white;
+                        border-radius: 12px 12px 2px 12px;
+                    }
+
                     .assistant-message {
-                        background-color: var(--vscode-editor-inactiveSelectionBackground);
                         margin-right: auto;
                     }
+
+                    .assistant-message .message-content {
+                        background-color: var(--vscode-editor-inactiveSelectionBackground);
+                        border-radius: 12px 12px 12px 2px;
+                        border: 1px solid var(--card-border);
+                    }
+
                     .input-container {
+                        background: var(--card-bg);
+                        border: 1px solid var(--card-border);
+                        border-radius: 12px;
+                        padding: 16px;
+                        gap: 12px;
                         display: flex;
                         flex-direction: column;
-                        gap: 8px;
-                        min-height: 100px;
-                        max-height: 200px;
+                        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
                     }
-                    .file-format-help {
+
+                    .help-toggle {
                         font-size: 12px;
-                        padding: 8px;
-                        background-color: var(--vscode-editor-inactiveSelectionBackground);
-                        border-radius: 4px;
-                        margin-bottom: 8px;
+                        color: var(--accent-color);
+                        cursor: pointer;
+                        text-decoration: none;
+                        display: inline-flex;
+                        align-items: center;
+                        gap: 4px;
+                        transition: all 0.2s ease;
                     }
+
+                    .help-toggle:hover {
+                        color: var(--accent-color-light);
+                    }
+
+                    .help-toggle::before {
+                        content: '💡';
+                        font-size: 14px;
+                    }
+
+                    .file-format-help {
+                        background: var(--card-bg);
+                        border: 1px solid var(--card-border);
+                        border-radius: 8px;
+                        padding: 16px;
+                        font-size: 13px;
+                        margin-bottom: 12px;
+                        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+                    }
+
                     .file-format-help pre {
-                        margin: 6px 0;
-                        padding: 6px;
-                        background-color: var(--vscode-editor-background);
-                        border-radius: 3px;
-                        font-size: 11px;
+                        background: var(--vscode-editor-background);
+                        border: 1px solid var(--card-border);
+                        border-radius: 6px;
+                        padding: 12px;
+                        font-size: 12px;
+                        margin: 8px 0;
+                        overflow-x: auto;
                     }
+
                     .input-row {
                         display: flex;
-                        gap: 8px;
+                        gap: 12px;
+                        align-items: flex-end;
                     }
+
                     textarea {
                         flex-grow: 1;
-                        padding: 6px;
+                        padding: 12px;
                         border: 1px solid var(--vscode-input-border);
                         background: var(--vscode-input-background);
                         color: var(--vscode-input-foreground);
+                        border-radius: 8px;
                         resize: vertical;
                         min-height: 60px;
+                        max-height: 200px;
                         font-family: var(--vscode-editor-font-family);
                         font-size: var(--vscode-editor-font-size);
+                        line-height: 1.5;
+                        transition: border-color 0.2s ease;
                     }
+
+                    textarea:focus {
+                        outline: none;
+                        border-color: var(--accent-color);
+                    }
+
                     button {
-                        padding: 6px 12px;
-                        background: var(--vscode-button-background);
-                        color: var(--vscode-button-foreground);
+                        padding: 10px 20px;
+                        background: var(--accent-color);
+                        color: white;
                         border: none;
+                        border-radius: 8px;
                         cursor: pointer;
-                        align-self: flex-end;
+                        font-weight: 500;
+                        transition: all 0.2s ease;
+                        display: inline-flex;
+                        align-items: center;
+                        gap: 6px;
                     }
+
+                    button::after {
+                        content: '↗️';
+                        font-size: 14px;
+                    }
+
                     button:hover {
-                        background: var(--vscode-button-hoverBackground);
+                        background: var(--accent-color-light);
+                        transform: translateY(-1px);
                     }
-                    .help-toggle {
-                        font-size: 11px;
-                        color: var(--vscode-textLink-foreground);
-                        cursor: pointer;
-                        text-decoration: underline;
-                        margin-bottom: 6px;
+
+                    .status-indicator {
+                        display: inline-flex;
+                        align-items: center;
+                        gap: 4px;
+                        font-size: 12px;
+                        padding: 4px 8px;
+                        border-radius: 12px;
+                        margin-bottom: 4px;
                     }
+
+                    .status-indicator.planning {
+                        background: var(--accent-color-light);
+                        color: var(--accent-color);
+                    }
+
+                    .status-indicator.executing {
+                        background: var(--warning-color-light);
+                        color: var(--warning-color);
+                    }
+
+                    .status-indicator.success {
+                        background: var(--success-color);
+                        color: white;
+                    }
+
+                    .status-indicator.error {
+                        background: var(--error-color);
+                        color: white;
+                    }
+
                     pre {
                         white-space: pre-wrap;
                         word-wrap: break-word;
                     }
+
                     code {
                         font-family: var(--vscode-editor-font-family);
                         font-size: var(--vscode-editor-font-size);
+                        background: var(--vscode-editor-background);
+                        padding: 2px 4px;
+                        border-radius: 4px;
                     }
                 </style>
             </head>
@@ -378,7 +502,7 @@ Please implement this step now.`;
                     <div class="input-container">
                         <div class="help-toggle" id="helpToggle">Show file creation format help</div>
                         <div class="file-format-help" id="fileFormatHelp" style="display: none;">
-                            <strong>File Creation Format:</strong>
+                            <strong>File Creation Format</strong>
                             <p>To create files, use this exact format:</p>
                             <pre>### filename.ext
 EXACT file content here (no markdown formatting)
@@ -646,102 +770,177 @@ class FileViewProvider implements vscode.WebviewViewProvider {
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <title>Project Files</title>
                 <style>
+                    :root {
+                        --card-bg: var(--vscode-editor-background);
+                        --card-border: var(--vscode-panel-border);
+                        --accent-color: #0098ff;
+                        --accent-color-light: #0098ff33;
+                        --warning-color: #ff8c00;
+                        --warning-color-light: #ff8c0033;
+                    }
+
                     body {
-                        padding: 10px;
+                        padding: 16px;
                         color: var(--vscode-editor-foreground);
                         background-color: var(--vscode-editor-background);
-                        font-family: var(--vscode-editor-font-family);
-                        font-size: var(--vscode-editor-font-size);
+                        font-family: var(--vscode-font-family);
+                        line-height: 1.5;
                     }
+
                     .file-tree {
                         user-select: none;
+                        animation: fadeIn 0.3s ease-in-out;
                     }
+
+                    @keyframes fadeIn {
+                        from { opacity: 0; transform: translateY(10px); }
+                        to { opacity: 1; transform: translateY(0); }
+                    }
+
                     .directory {
-                        margin-left: 20px;
+                        margin-left: 24px;
+                        border-left: 1px solid var(--card-border);
+                        padding-left: 4px;
                     }
+
                     .directory-name {
                         cursor: pointer;
-                        padding: 2px 0;
+                        padding: 8px 12px;
+                        border-radius: 6px;
                         display: flex;
                         align-items: center;
+                        transition: all 0.2s ease;
+                        margin: 4px 0;
                     }
+
                     .directory-name:hover {
                         background-color: var(--vscode-list-hoverBackground);
                     }
+
                     .file {
-                        margin-left: 20px;
+                        margin-left: 24px;
                         cursor: pointer;
-                        padding: 2px 0;
+                        padding: 6px 12px;
+                        border-radius: 6px;
                         display: flex;
                         align-items: center;
+                        transition: all 0.2s ease;
+                        margin: 4px 0;
                     }
+
                     .file:hover {
                         background-color: var(--vscode-list-hoverBackground);
+                        transform: translateX(2px);
                     }
+
                     .collapsed {
                         display: none;
                     }
+
                     .icon {
-                        margin-right: 5px;
+                        margin-right: 8px;
+                        font-size: 16px;
+                        width: 20px;
+                        text-align: center;
                     }
+
                     .included {
-                        color: #0098ff;
+                        color: var(--accent-color);
                     }
+
                     .excluded {
-                        color: #ff8c00;
+                        color: var(--warning-color);
                     }
+
                     .context-indicator {
                         width: 8px;
                         height: 8px;
                         border-radius: 50%;
-                        margin-left: 5px;
+                        margin-left: 8px;
+                        transition: all 0.2s ease;
                     }
+
                     .context-indicator.included {
-                        background-color: #0098ff;
+                        background-color: var(--accent-color);
+                        box-shadow: 0 0 4px var(--accent-color);
                     }
+
                     .context-indicator.excluded {
-                        background-color: #ff8c00;
+                        background-color: var(--warning-color);
+                        box-shadow: 0 0 4px var(--warning-color);
                     }
+
                     .actions {
                         margin-left: auto;
                         display: flex;
-                        gap: 5px;
-                    }
-                    .action-button {
-                        padding: 2px 4px;
-                        border-radius: 3px;
-                        font-size: 10px;
-                        cursor: pointer;
+                        gap: 8px;
                         opacity: 0;
-                        transition: opacity 0.2s;
+                        transition: opacity 0.2s ease;
                     }
-                    .file:hover .action-button,
-                    .directory-name:hover .action-button {
+
+                    .file:hover .actions,
+                    .directory-name:hover .actions {
                         opacity: 1;
                     }
+
+                    .action-button {
+                        padding: 4px 8px;
+                        border-radius: 4px;
+                        font-size: 11px;
+                        cursor: pointer;
+                        transition: all 0.2s ease;
+                        display: flex;
+                        align-items: center;
+                        gap: 4px;
+                    }
+
                     .include-button {
-                        background-color: #0098ff33;
-                        color: #0098ff;
+                        background-color: var(--accent-color-light);
+                        color: var(--accent-color);
                     }
+
+                    .include-button:hover {
+                        background-color: var(--accent-color);
+                        color: white;
+                    }
+
                     .exclude-button {
-                        background-color: #ff8c0033;
-                        color: #ff8c00;
+                        background-color: var(--warning-color-light);
+                        color: var(--warning-color);
                     }
+
+                    .exclude-button:hover {
+                        background-color: var(--warning-color);
+                        color: white;
+                    }
+
                     .file.selected {
                         background-color: var(--vscode-list-activeSelectionBackground);
                         color: var(--vscode-list-activeSelectionForeground);
+                        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+                        transform: translateX(4px);
                     }
+
                     .file.selected .context-indicator.included {
                         background-color: var(--vscode-list-activeSelectionForeground);
+                        box-shadow: none;
                     }
+
                     .file.selected .context-indicator.excluded {
                         background-color: var(--vscode-list-activeSelectionForeground);
                         opacity: 0.7;
+                        box-shadow: none;
                     }
+
                     .file.selected .action-button {
-                        opacity: 1;
                         background-color: var(--vscode-list-activeSelectionBackground);
                         color: var(--vscode-list-activeSelectionForeground);
+                        border: 1px solid var(--vscode-list-activeSelectionForeground);
+                    }
+
+                    .file.selected .action-button:hover {
+                        background-color: var(--vscode-list-activeSelectionForeground);
+                        color: var(--vscode-list-activeSelectionBackground);
                     }
                 </style>
             </head>

@@ -18,19 +18,41 @@
     "Machine Learning"
   ],
   "activationEvents": [
-    "onCommand:falalo.startChat",
+    "onView:falaloChat",
     "onCommand:falalo.includeInContext",
     "onCommand:falalo.excludeFromContext",
     "onCommand:falalo.showContextItems"
   ],
   "main": "./dist/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "falalo-sidebar",
+          "title": "Falalo AI",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "falalo-sidebar": [
+        {
+          "type": "webview",
+          "id": "falaloChat",
+          "name": "AI Chat",
+          "icon": "media/icon.svg",
+          "contextualTitle": "Falalo AI Chat"
+        },
+        {
+          "type": "webview",
+          "id": "falaloFiles",
+          "name": "Project Files",
+          "icon": "media/icon.svg",
+          "contextualTitle": "Project Files"
+        }
+      ]
+    },
     "commands": [
-      {
-        "command": "falalo.startChat",
-        "title": "Falalo: Start AI Chat",
-        "category": "Falalo"
-      },
       {
         "command": "falalo.includeInContext",
         "title": "Falalo: Include in Chat Context",
@@ -86,14 +108,7 @@
           "description": "Google AI API Key for the chat functionality"
         }
       }
-    },
-    "keybindings": [
-      {
-        "command": "falalo.startChat",
-        "key": "ctrl+shift+a",
-        "mac": "cmd+shift+a"
-      }
-    ]
+    }
   },
   "capabilities": {
     "untrustedWorkspaces": {

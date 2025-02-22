@@ -61,42 +61,51 @@ class ContextManager {
     }
 }
 
-class ChatPanel {
-    public static currentPanel: ChatPanel | undefined;
-    private readonly panel: vscode.WebviewPanel;
-    private disposables: vscode.Disposable[] = [];
+class ChatViewProvider implements vscode.WebviewViewProvider {
+    public static readonly viewType = 'falaloChat';
+    private _view?: vscode.WebviewView;
     private genAI: GoogleGenerativeAI;
-    private extensionContext: vscode.ExtensionContext;
 
-    private constructor(panel: vscode.WebviewPanel, context: vscode.ExtensionContext) {
-        this.panel = panel;
-        this.extensionContext = context;
-        
-        // Initialize Google AI
+    constructor(
+        private readonly _extensionUri: vscode.Uri,
+        private readonly _extensionContext: vscode.ExtensionContext
+    ) {
         const config = vscode.workspace.getConfiguration('falalo');
         const apiKey = config.get('googleApiKey', '');
         this.genAI = new GoogleGenerativeAI(apiKey);
+    }
 
-        // Set up WebView
-        this.panel.webview.html = this.getWebviewContent();
-        this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
-        
-        // Handle messages from the webview
-        this.panel.webview.onDidReceiveMessage(
-            async message => {
-                switch (message.type) {
-                    case 'message':
-                        await this.handleUserMessage(message.text);
-                        break;
-                }
-            },
-            null,
-            this.disposables
-        );
+    public resolveWebviewView(
+        webviewView: vscode.WebviewView,
+        _context: vscode.WebviewViewResolveContext,
+        _token: vscode.CancellationToken,
+    ) {
+        this._view = webviewView;
+
+        webviewView.webview.options = {
+            enableScripts: true,
+            localResourceRoots: [
+                this._extensionUri
+            ]
+        };
+
+        webviewView.webview.html = this._getHtmlForWebview();
+
+        webviewView.webview.onDidReceiveMessage(async message => {
+            switch (message.type) {
+                case 'message':
+                    await this.handleUserMessage(message.text);
+                    break;
+            }
+        });
     }
 
     private async handleUserMessage(text: string) {
         try {
+            if (!this._view) {
+                return;
+            }
+
             // Add user message to chat
             this.addMessageToChat('user', text);
 
@@ -140,23 +149,12 @@ I'll create this file for you:
 </html>
 %%%
 
-For multiple files, you would add them like this:
-
-### src/index.html
-<!DOCTYPE html>
-<html>...</html>
-%%%
-
-### src/styles.css
-body { color: blue; }
-%%%
-
 Now, please respond to the following request:
 
 ${text}`;
 
             // Get response from Google AI
-            const model = this.genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+            const model = this.genAI.getGenerativeModel({ model: 'gemini-pro' });
             const result = await model.generateContent(aiInstructions);
             const response = result.response;
             const responseText = response.text();
@@ -208,14 +206,16 @@ ${text}`;
     }
 
     private addMessageToChat(role: 'user' | 'assistant', content: string) {
-        this.panel.webview.postMessage({
-            type: 'addMessage',
-            html: `
-                <div class="message ${role}-message">
-                    <div class="message-content">${this.escapeHtml(content)}</div>
-                </div>
-            `
-        });
+        if (this._view) {
+            this._view.webview.postMessage({
+                type: 'addMessage',
+                html: `
+                    <div class="message ${role}-message">
+                        <div class="message-content">${this.escapeHtml(content)}</div>
+                    </div>
+                `
+            });
+        }
     }
 
     private escapeHtml(unsafe: string): string {
@@ -227,30 +227,7 @@ ${text}`;
             .replace(/'/g, "&#039;");
     }
 
-    public static createOrShow(context: vscode.ExtensionContext) {
-        const column = vscode.window.activeTextEditor
-            ? vscode.window.activeTextEditor.viewColumn
-            : undefined;
-
-        if (ChatPanel.currentPanel) {
-            ChatPanel.currentPanel.panel.reveal(column);
-            return;
-        }
-
-        const panel = vscode.window.createWebviewPanel(
-            'falaloChat',
-            'Falalo AI Chat',
-            column || vscode.ViewColumn.One,
-            {
-                enableScripts: true,
-                retainContextWhenHidden: true
-            }
-        );
-
-        ChatPanel.currentPanel = new ChatPanel(panel, context);
-    }
-
-    private getWebviewContent() {
+    private _getHtmlForWebview() {
         return `
             <!DOCTYPE html>
             <html lang="en">
@@ -260,79 +237,101 @@ ${text}`;
                 <title>Falalo AI Chat</title>
                 <style>
                     body {
-                        padding: 20px;
+                        padding: 10px;
                         color: var(--vscode-editor-foreground);
                         background-color: var(--vscode-editor-background);
+                        display: flex;
+                        flex-direction: column;
+                        height: 100vh;
+                        margin: 0;
                     }
                     .chat-container {
                         display: flex;
                         flex-direction: column;
-                        height: calc(100vh - 40px);
+                        height: 100%;
                     }
                     .messages {
                         flex-grow: 1;
                         overflow-y: auto;
-                        margin-bottom: 20px;
+                        margin-bottom: 10px;
+                        padding-right: 5px;
                     }
                     .message {
-                        margin: 10px 0;
-                        padding: 10px;
-                        border-radius: 5px;
+                        margin: 5px 0;
+                        padding: 8px;
+                        border-radius: 4px;
+                        max-width: 95%;
+                        word-wrap: break-word;
                     }
                     .user-message {
                         background-color: var(--vscode-editor-selectionBackground);
-                        margin-left: 20%;
+                        margin-left: auto;
                     }
                     .assistant-message {
                         background-color: var(--vscode-editor-inactiveSelectionBackground);
-                        margin-right: 20%;
+                        margin-right: auto;
                     }
                     .input-container {
                         display: flex;
                         flex-direction: column;
-                        gap: 10px;
+                        gap: 8px;
+                        min-height: 100px;
+                        max-height: 200px;
                     }
                     .file-format-help {
                         font-size: 12px;
                         padding: 8px;
                         background-color: var(--vscode-editor-inactiveSelectionBackground);
                         border-radius: 4px;
-                        margin-bottom: 10px;
+                        margin-bottom: 8px;
                     }
                     .file-format-help pre {
-                        margin: 8px 0;
-                        padding: 8px;
+                        margin: 6px 0;
+                        padding: 6px;
                         background-color: var(--vscode-editor-background);
-                        border-radius: 4px;
+                        border-radius: 3px;
+                        font-size: 11px;
                     }
                     .input-row {
                         display: flex;
-                        gap: 10px;
+                        gap: 8px;
                     }
                     textarea {
                         flex-grow: 1;
-                        padding: 8px;
+                        padding: 6px;
                         border: 1px solid var(--vscode-input-border);
                         background: var(--vscode-input-background);
                         color: var(--vscode-input-foreground);
-                        resize: none;
+                        resize: vertical;
+                        min-height: 60px;
+                        font-family: var(--vscode-editor-font-family);
+                        font-size: var(--vscode-editor-font-size);
                     }
                     button {
-                        padding: 8px 16px;
+                        padding: 6px 12px;
                         background: var(--vscode-button-background);
                         color: var(--vscode-button-foreground);
                         border: none;
                         cursor: pointer;
+                        align-self: flex-end;
                     }
                     button:hover {
                         background: var(--vscode-button-hoverBackground);
                     }
                     .help-toggle {
-                        font-size: 12px;
+                        font-size: 11px;
                         color: var(--vscode-textLink-foreground);
                         cursor: pointer;
                         text-decoration: underline;
-                        margin-bottom: 8px;
+                        margin-bottom: 6px;
+                    }
+                    pre {
+                        white-space: pre-wrap;
+                        word-wrap: break-word;
+                    }
+                    code {
+                        font-family: var(--vscode-editor-font-family);
+                        font-size: var(--vscode-editor-font-size);
                     }
                 </style>
             </head>
@@ -365,9 +364,9 @@ console.log('Hello');
 %%%</pre>
                         </div>
                         <div class="input-row">
-                            <textarea id="userInput" rows="3" placeholder="Type your message... Use ### filename.ext to start a file and %%% to end it"></textarea>
-                            <button id="sendButton">Send</button>
+                            <textarea id="userInput" placeholder="Type your message... Use ### filename.ext to start a file and %%% to end it"></textarea>
                         </div>
+                        <button id="sendButton">Send</button>
                     </div>
                 </div>
                 <script>
@@ -415,29 +414,229 @@ console.log('Hello');
             </html>
         `;
     }
+}
 
-    private dispose() {
-        ChatPanel.currentPanel = undefined;
-        this.panel.dispose();
-        while (this.disposables.length) {
-            const disposable = this.disposables.pop();
-            if (disposable) {
-                disposable.dispose();
+class FileViewProvider implements vscode.WebviewViewProvider {
+    public static readonly viewType = 'falaloFiles';
+    private _view?: vscode.WebviewView;
+
+    constructor(
+        private readonly _extensionUri: vscode.Uri,
+        private readonly _extensionContext: vscode.ExtensionContext
+    ) {}
+
+    public resolveWebviewView(
+        webviewView: vscode.WebviewView,
+        _context: vscode.WebviewViewResolveContext,
+        _token: vscode.CancellationToken,
+    ) {
+        this._view = webviewView;
+
+        webviewView.webview.options = {
+            enableScripts: true,
+            localResourceRoots: [
+                this._extensionUri
+            ]
+        };
+
+        webviewView.webview.html = this._getHtmlForWebview();
+        
+        // Initial file list update
+        this.updateFileList();
+
+        // Set up file system watcher
+        const watcher = vscode.workspace.createFileSystemWatcher('**/*');
+        watcher.onDidCreate(() => this.updateFileList());
+        watcher.onDidDelete(() => this.updateFileList());
+        watcher.onDidChange(() => this.updateFileList());
+
+        // Handle messages from the webview
+        webviewView.webview.onDidReceiveMessage(async message => {
+            switch (message.type) {
+                case 'openFile':
+                    const document = await vscode.workspace.openTextDocument(message.path);
+                    await vscode.window.showTextDocument(document);
+                    break;
+            }
+        });
+    }
+
+    private async updateFileList() {
+        if (!this._view || !vscode.workspace.workspaceFolders) {
+            return;
+        }
+
+        const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
+        const files = await glob.glob('**/*', { 
+            cwd: workspaceRoot,
+            nodir: true,
+            ignore: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**']
+        });
+
+        // Sort files by path
+        files.sort();
+
+        // Group files by directory
+        const fileTree = this.buildFileTree(files);
+
+        this._view.webview.postMessage({
+            type: 'updateFiles',
+            files: fileTree
+        });
+    }
+
+    private buildFileTree(files: string[]) {
+        const tree: any = {};
+        
+        for (const file of files) {
+            const parts = file.split('/');
+            let current = tree;
+            
+            for (let i = 0; i < parts.length; i++) {
+                const part = parts[i];
+                if (i === parts.length - 1) {
+                    // It's a file
+                    if (!current.files) {
+                        current.files = [];
+                    }
+                    current.files.push(part);
+                } else {
+                    // It's a directory
+                    if (!current.dirs) {
+                        current.dirs = {};
+                    }
+                    if (!current.dirs[part]) {
+                        current.dirs[part] = {};
+                    }
+                    current = current.dirs[part];
+                }
             }
         }
+        
+        return tree;
+    }
+
+    private _getHtmlForWebview() {
+        return `
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Project Files</title>
+                <style>
+                    body {
+                        padding: 10px;
+                        color: var(--vscode-editor-foreground);
+                        background-color: var(--vscode-editor-background);
+                        font-family: var(--vscode-editor-font-family);
+                        font-size: var(--vscode-editor-font-size);
+                    }
+                    .file-tree {
+                        user-select: none;
+                    }
+                    .directory {
+                        margin-left: 20px;
+                    }
+                    .directory-name {
+                        cursor: pointer;
+                        color: var(--vscode-symbolIcon-folderForeground);
+                        padding: 2px 0;
+                    }
+                    .directory-name:hover {
+                        background-color: var(--vscode-list-hoverBackground);
+                    }
+                    .file {
+                        margin-left: 20px;
+                        cursor: pointer;
+                        padding: 2px 0;
+                    }
+                    .file:hover {
+                        background-color: var(--vscode-list-hoverBackground);
+                    }
+                    .collapsed {
+                        display: none;
+                    }
+                    .icon {
+                        margin-right: 5px;
+                    }
+                </style>
+            </head>
+            <body>
+                <div id="file-tree" class="file-tree"></div>
+                <script>
+                    const vscode = acquireVsCodeApi();
+                    const fileTree = document.getElementById('file-tree');
+
+                    function createFileTree(tree, parentElement, path = '') {
+                        // Handle directories
+                        if (tree.dirs) {
+                            for (const [dirName, content] of Object.entries(tree.dirs)) {
+                                const dirDiv = document.createElement('div');
+                                const dirNameDiv = document.createElement('div');
+                                const contentDiv = document.createElement('div');
+                                
+                                dirNameDiv.className = 'directory-name';
+                                dirNameDiv.innerHTML = '📁 ' + dirName;
+                                contentDiv.className = 'directory';
+                                
+                                dirDiv.appendChild(dirNameDiv);
+                                dirDiv.appendChild(contentDiv);
+                                parentElement.appendChild(dirDiv);
+
+                                dirNameDiv.addEventListener('click', () => {
+                                    contentDiv.classList.toggle('collapsed');
+                                    dirNameDiv.innerHTML = (contentDiv.classList.contains('collapsed') ? '📁 ' : '📂 ') + dirName;
+                                });
+
+                                createFileTree(content, contentDiv, path + dirName + '/');
+                            }
+                        }
+
+                        // Handle files
+                        if (tree.files) {
+                            for (const file of tree.files) {
+                                const fileDiv = document.createElement('div');
+                                fileDiv.className = 'file';
+                                fileDiv.innerHTML = '📄 ' + file;
+                                fileDiv.addEventListener('click', () => {
+                                    vscode.postMessage({
+                                        type: 'openFile',
+                                        path: path + file
+                                    });
+                                });
+                                parentElement.appendChild(fileDiv);
+                            }
+                        }
+                    }
+
+                    window.addEventListener('message', event => {
+                        const message = event.data;
+                        switch (message.type) {
+                            case 'updateFiles':
+                                fileTree.innerHTML = '';
+                                createFileTree(message.files, fileTree);
+                                break;
+                        }
+                    });
+                </script>
+            </body>
+            </html>
+        `;
     }
 }
 
 export function activate(context: vscode.ExtensionContext) {
     const contextManager = new ContextManager();
+    const chatViewProvider = new ChatViewProvider(context.extensionUri, context);
+    const fileViewProvider = new FileViewProvider(context.extensionUri, context);
+
+    context.subscriptions.push(
+        vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, chatViewProvider),
+        vscode.window.registerWebviewViewProvider(FileViewProvider.viewType, fileViewProvider)
+    );
 
     let disposables: vscode.Disposable[] = [];
-
-    disposables.push(
-        vscode.commands.registerCommand('falalo.startChat', () => {
-            ChatPanel.createOrShow(context);
-        })
-    );
 
     disposables.push(
         vscode.commands.registerCommand('falalo.includeInContext', async () => {

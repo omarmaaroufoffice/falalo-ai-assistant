@@ -136,56 +136,64 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
                 contextInfo += '\nExcluded files from context:\n' + excludedFiles.join('\n');
             }
 
-            // Prepare the message with file creation instructions and context
-            const aiInstructions = `You have the following context about the workspace:${contextInfo}
+            // Stage 1: Planning Phase
+            const planningInstructions = `You are a planning AI. Your role is to:
+1. Analyze the user's request and break it down into specific, actionable steps
+2. Each step should be clear and achievable
+3. Steps should be in logical order
+4. Include any dependencies or prerequisites
+5. Format your response as a numbered list
+6. Be specific about file operations, code changes, or other actions needed
 
-IMPORTANT: When creating files, follow these rules exactly:
-1. First provide your normal response with explanations
-2. Then, for each file you want to create:
-   - Start with "###" followed by the filename on its own line
-   - Put the EXACT file content on the next line(s) WITHOUT any markdown formatting
-   - End with "%%%" on its own line
-   - Leave one blank line between multiple files
+You have the following context about the workspace:${contextInfo}
 
-Example of correct file creation format:
-
-I'll create a Python script that does X and Y.
-
-### example.py
-def main():
-    print("Hello, World!")
-    
-if __name__ == "__main__":
-    main()
-%%%
-
-### styles.css
-.button {
-    color: blue;
-    padding: 10px;
-}
-%%%
-
-DO NOT include any markdown formatting (like \`\`\`python) around the file content.
-The content between ### and %%% should be exactly what will be written to the file.
-
-Now, please respond to the following request:
-
+Please analyze this request and provide a step-by-step plan:
 ${text}`;
 
-            // Get response from Google AI
-            const model = this.genAI.getGenerativeModel({ model: 'gemini-pro' });
-            const result = await model.generateContent(aiInstructions);
-            const response = result.response;
-            const responseText = response.text();
+            // Get plan from AI
+            const planningModel = this.genAI.getGenerativeModel({ model: 'gemini-pro' });
+            const planResult = await planningModel.generateContent(planningInstructions);
+            const plan = planResult.response.text();
             
-            // Add AI response to chat
-            this.addMessageToChat('assistant', responseText);
+            // Show the plan to the user
+            this.addMessageToChat('assistant', '🔍 Planning Phase:\n\n' + plan);
 
-            // Process any file creation markers in the response
-            await this.processFileCreationMarkers(responseText);
+            // Stage 2: Execution Phase
+            const steps = plan.split('\n').filter(line => /^\d+\./.test(line));
+            
+            for (const step of steps) {
+                // Prepare execution instructions for each step
+                const executionInstructions = `You are an execution AI. Your role is to implement the following step:
+
+${step}
+
+When creating files, follow these rules exactly:
+1. Start with "###" followed by the filename on its own line
+2. Put the EXACT file content on the next line(s) WITHOUT any markdown formatting
+3. End with "%%%" on its own line
+4. Leave one blank line between multiple files
+
+You have the following context about the workspace:${contextInfo}
+
+Please implement this step now.`;
+
+                // Get implementation from AI
+                const executionModel = this.genAI.getGenerativeModel({ model: 'gemini-pro' });
+                const executionResult = await executionModel.generateContent(executionInstructions);
+                const implementation = executionResult.response.text();
+                
+                // Show the implementation
+                this.addMessageToChat('assistant', `📝 Executing Step: ${step}\n\n${implementation}`);
+
+                // Process any file creation markers in the implementation
+                await this.processFileCreationMarkers(implementation);
+            }
+
+            // Final completion message
+            this.addMessageToChat('assistant', '✅ All steps have been completed!');
         } catch (error) {
             vscode.window.showErrorMessage(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+            this.addMessageToChat('assistant', '❌ An error occurred while processing your request.');
         }
     }
 

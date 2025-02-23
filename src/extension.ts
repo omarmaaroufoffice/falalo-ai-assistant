@@ -409,126 +409,6 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
         });
     }
 
-    private async executeCommandWithRetry(command: string, retryCount = 0): Promise<boolean> {
-        // Log command execution attempt
-        this.logger.log('COMMAND_EXECUTION', `Executing command (attempt ${retryCount + 1})`, { command });
-
-        if (!vscode.workspace.workspaceFolders) {
-            throw new Error('No workspace folder is open');
-        }
-
-        const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
-
-        try {
-            return new Promise<boolean>((resolve) => {
-                const terminalId = `Falalo-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-                
-                // Create terminal with proper working directory
-                const terminal = vscode.window.createTerminal({
-                    name: terminalId,
-                    shellPath: process.platform === 'win32' ? 'cmd.exe' : '/bin/bash',
-                    cwd: workspaceRoot
-                });
-
-                this.activeTerminals.set(terminalId, terminal);
-
-                // Detect if this is a long-running command
-                const isLongRunningCommand = command.match(/(npm run (dev|start|serve)|ng serve|python manage\.py runserver|rails s|yarn (start|dev)|docker-compose up)/i);
-
-                // For long-running commands
-                if (isLongRunningCommand) {
-                    this.logger.log('COMMAND_LONG_RUNNING', 'Starting long-running command', { command, terminalId });
-                    this.addMessageToChat('assistant', `🚀 Starting long-running command in terminal ${terminalId}:\n${command}`);
-                    terminal.show(true);
-                    
-                    // First ensure we're in the right directory
-                    terminal.sendText(`cd "${workspaceRoot}"`);
-                    terminal.sendText(command);
-                    
-                    resolve(true);
-                    return;
-                }
-
-                // For regular commands
-                const outputPath = path.join(workspaceRoot, `.output_${terminalId}`);
-                const errorPath = path.join(workspaceRoot, `.error_${terminalId}`);
-                const exitCodePath = path.join(workspaceRoot, `.exitcode_${terminalId}`);
-
-                // Set up command completion detection
-                const disposable = vscode.window.onDidCloseTerminal(async closedTerminal => {
-                    if (closedTerminal === terminal) {
-                        disposable.dispose();
-                        this.activeTerminals.delete(terminalId);
-
-                        try {
-                            // Read command output
-                            const [output, errors, exitCodeStr] = await Promise.all([
-                                fs.promises.readFile(outputPath, 'utf8').catch(() => ''),
-                                fs.promises.readFile(errorPath, 'utf8').catch(() => ''),
-                                fs.promises.readFile(exitCodePath, 'utf8').catch(() => '1')
-                            ]);
-
-                            // Clean up temp files
-                            await Promise.all([
-                                fs.promises.unlink(outputPath).catch(() => {}),
-                                fs.promises.unlink(errorPath).catch(() => {}),
-                                fs.promises.unlink(exitCodePath).catch(() => {})
-                            ]);
-
-                            const actualExitCode = parseInt(exitCodeStr.trim(), 10);
-                            const fullOutput = `OUTPUT:\n${output}\n\nERRORS:\n${errors}`;
-                            
-                            // Update terminal output history
-                            this.terminalOutput = `${this.terminalOutput}\n$ ${command} (Terminal: ${terminalId})\n${fullOutput}\nExit code: ${actualExitCode}\n`;
-
-                            if (actualExitCode === 0) {
-                                this.logger.log('COMMAND_SUCCESS', 'Command executed successfully', { 
-                                    command, 
-                                    terminalId, 
-                                    output: fullOutput 
-                                });
-                                resolve(true);
-                            } else {
-                                this.logger.log('COMMAND_FAILURE', 'Command failed', { 
-                                    command, 
-                                    terminalId, 
-                                    exitCode: actualExitCode, 
-                                    output: fullOutput 
-                                });
-                                
-                                // Try to recover from failure
-                                const recovered = await this.handleCommandFailure(command, errors, fullOutput);
-                                resolve(recovered);
-                            }
-                        } catch (error) {
-                            this.logger.log('COMMAND_ERROR', 'Error processing command output', { 
-                                command, 
-                                error: error instanceof Error ? error.message : 'Unknown error' 
-                            });
-                            resolve(false);
-                        }
-                    }
-                });
-
-                terminal.show(true);
-                
-                // Ensure we're in the right directory and capture all output
-                const wrappedCommand = process.platform === 'win32' 
-                    ? `cd "${workspaceRoot}" && ${command} > "${outputPath}" 2> "${errorPath}" & echo %ERRORLEVEL% > "${exitCodePath}" & exit`
-                    : `cd "${workspaceRoot}" && ${command} > "${outputPath}" 2> "${errorPath}"; echo $? > "${exitCodePath}"; exit`;
-                
-                this.addMessageToChat('assistant', `🚀 Executing command in terminal ${terminalId}:\n${command}`);
-                terminal.sendText(wrappedCommand);
-            });
-        } catch (error) {
-            this.logger.log('COMMAND_ERROR', 'Error executing command', { 
-                command, 
-                error: error instanceof Error ? error.message : 'Unknown error' 
-            });
-            return false;
-        }
-    }
-
     private async handleStepError(step: {content: string, isLongRunning: boolean}, error: unknown): Promise<boolean> {
         try {
             this.logger.log('STEP_ERROR', 'Attempting to recover from step error', { step, error });
@@ -560,6 +440,62 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
+    private async refineUserPrompt(text: string): Promise<string> {
+        this.addMessageToChat('assistant', '🔄 Refining your website requirements...');
+        
+        const refinementPrompt = `Act as a Prompt Refinement Engine for website creation. Expand the following user's input into a complete, detailed website specification. Make educated guesses for missing details and annotate assumptions with [ASSUMPTION].
+
+User's Input: "${text}"
+
+Instructions:
+1. Clarify the website's primary purpose and goals
+2. Define the target audience and their needs
+3. Specify design preferences (colors, typography, layout)
+4. List required pages and features
+5. Include technical requirements and SEO considerations
+
+Output Format:
+**Refined Website Specification**
+- Purpose: [Main goal + use cases]
+- Audience: [Target users + needs]
+- Design:
+  - Colors: [Color scheme]
+  - Typography: [Font choices]
+  - Layout: [Structure preferences]
+- Content/Features: [Pages + functionalities]
+- Technical: [Framework + SEO + performance]
+
+Keep the output organized and detailed. Flag any assumptions made.`;
+
+        const refinementCompletion = await this.openai.chat.completions.create({
+            model: 'o3-mini',
+            messages: [
+                { 
+                    role: 'system', 
+                    content: 'You are an expert in website planning and requirements analysis. Help refine and expand website creation requests into detailed specifications.' 
+                },
+                { role: 'user', content: refinementPrompt }
+            ]
+        });
+
+        const refinedSpec = refinementCompletion.choices[0].message.content || '';
+        
+        // Log the refinement
+        this.logger.log('PROMPT_REFINEMENT', 'Refined user prompt', {
+            originalPrompt: text,
+            refinedSpec: refinedSpec
+        });
+
+        // Show the refined spec to the user
+        this.addMessageToChat('assistant', `📋 I've refined your website requirements:
+
+${refinedSpec}
+
+Creating your website based on these specifications...`);
+
+        return refinedSpec;
+    }
+
     private async handleUserMessage(text: string) {
         try {
             if (!this._view) {
@@ -571,6 +507,9 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
             const startTime = Date.now();
 
             this.addMessageToChat('user', text);
+
+            // First, refine the user's prompt
+            const refinedSpec = await this.refineUserPrompt(text);
 
             const includedFiles = this.contextManager.getIncludedFiles();
             const excludedFiles = this.contextManager.getExcludedFiles();
@@ -595,172 +534,131 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
             if (excludedFiles.length > 0) {
                 contextInfo += '\nExcluded files from context:\n' + excludedFiles.join('\n');
             }
-            
-            // Always include recent terminal output in context
-            if (this.terminalOutput) {
-                contextInfo += '\nRecent terminal activity:\n' + this.terminalOutput;
-            }
 
-            // Stage 1: Planning Phase with improved instructions
-            const planningInstructions = `User request: "${text}"
+            // Get all existing files in workspace
+            const workspaceRoot = vscode.workspace.workspaceFolders![0].uri.fsPath;
+            const existingFiles = await glob.glob('**/*', { 
+                cwd: workspaceRoot,
+                nodir: true,
+                ignore: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**']
+            });
 
-<CURRENT_CURSOR_POSITION>
-Create a clear, step-by-step implementation plan focusing on:
+            const websiteInstructions = `Refined Website Specification:
+${refinedSpec}
 
-1-THE ACTUAL USER REQUEST AND THE CONTEXT OF THE WORKSPACE AND THE ACUTAL CODE, YOUR  JOB IS TO FOCUS ON THE CREATING AND UPDATING AND IMPORVING THE CODE.
-2-Divide the code creation into steps, each step should be a single file or a small group of files.
-3-Make the code extensive and detailed.
-4-always make it look good.
-5-Do not execute a single command untill you have created all the files and improved the code.
-6-Execute the commands only after you have created all the files and improved the code.
-7-EXECUTING COMMNANDS IS ONLY ALLOWED IN THE LAST 2 STEPS
+You are a website developer tasked with creating a complete, modern, and beautiful website based on the above specifications. Generate all necessary files in a single response.
 
-Number each step clearly as "Step 1:", "Step 2:", etc.
-Mark long-running operations with [LONG-RUNNING] prefix
-Group related operations together
+Requirements:
+
+1. Create three files with extensive, non-filler content:
+   - index.html (minimum 500 lines)
+   - styles.css (minimum 1000 lines)
+   - script.js (minimum 600 lines)
+
+HTML Requirements (index.html):
+- Modern semantic structure with multiple sections
+- Responsive layout with flexbox/grid
+- Interactive forms and components
+- Proper meta tags and SEO elements
+- Beautiful and professional design
+- Extensive content sections
+- NO PLACEHOLDER CONTENT
+
+CSS Requirements (styles.css):
+- Modern design patterns and layouts
+- Complex animations and transitions
+- Comprehensive responsive design
+- Custom properties (CSS variables)
+- Advanced selectors and hover states
+- Multiple breakpoints
+- Beautiful color schemes
+- NO FILLER STYLES
+
+JavaScript Requirements (script.js):
+- Modern ES6+ features
+- Interactive UI components
+- Form validation
+- Smooth animations
+- Event handling
+- DOM manipulation
+- State management
+- NO FILLER FUNCTIONS
+
+Create each file using this format:
+### filename.ext
+content
+%%%
 
 Workspace context:${contextInfo}
 
-Focus on:
-1. MAKING THE ACTUAL CODE AND MAKING IT EXTENSIVE AND DETAILED AND LOOK GOOD`;
+Existing files (DO NOT recreate these):
+${existingFiles.join('\n')}
 
-            // Get plan from AI
-            const planCompletion = await this.openai.chat.completions.create({
+Focus on creating a cohesive, professional website with extensive functionality and modern design that matches the refined specifications exactly.`;
+
+            // Get implementation from AI
+            const completion = await this.openai.chat.completions.create({
                 model: 'o3-mini',
                 messages: [
                     { 
                         role: 'system', 
-                        content: 'You are an exceptional software architect with deep knowledge of clean code, design patterns, and software engineering best practices. Create detailed, well-structured implementations with excellent code quality and comprehensive documentation.' 
+                        content: 'You are an exceptional website developer with deep knowledge of modern web development, design patterns, and best practices. Create detailed, well-structured implementations with excellent code quality.' 
                     },
                     { role: 'user', content: text },
-                    { role: 'assistant', content: 'I will help create a robust and well-architected implementation.' },
-                    { role: 'user', content: planningInstructions }
-                ],
+                    { role: 'assistant', content: 'I will create a complete, modern website with extensive HTML, CSS, and JavaScript.' },
+                    { role: 'user', content: websiteInstructions }
+                ]
             });
 
-            // Log complete AI planning response including raw response
-            this.logger.log('AI_PLAN_RESPONSE', 'AI planning completion', {
-                rawResponse: planCompletion,
-                planContent: planCompletion.choices[0].message.content,
-                model: planCompletion.model,
-                usage: planCompletion.usage
+            // Log AI response
+            this.logger.log('AI_RESPONSE', 'AI completion', {
+                rawResponse: completion,
+                content: completion.choices[0].message.content,
+                model: completion.model,
+                usage: completion.usage
             });
 
             // Update token count
-            await this.updateTokenCount(planCompletion);
+            await this.updateTokenCount(completion);
 
-            const plan = planCompletion.choices[0].message.content || '';
+            const implementation = completion.choices[0].message.content || '';
             
-            // Show the plan to the user
-            this.addMessageToChat('assistant', '🔍 Planning Phase:\n\n' + plan);
-
-            // Stage 2: Execution Phase
-            // Extract steps using a more flexible pattern that includes [LONG-RUNNING] prefix
-            const stepRegex = /(?:Step\s*(\d+)[:.]\s*(?:\[LONG-RUNNING\]\s*)?|^(\d+)[:.]\s*(?:\[LONG-RUNNING\]\s*)?)(.*?)(?=(?:\n\s*(?:Step\s*\d+[:.]\s*|\d+[:.]\s*)|$))/gims;
-            const steps: Array<{content: string, isLongRunning: boolean}> = [];
-            let match;
-
-            while ((match = stepRegex.exec(plan)) !== null) {
-                const stepContent = match[3].trim();
-                const isLongRunning = match[0].includes('[LONG-RUNNING]');
-                if (stepContent) {
-                    steps.push({ content: stepContent, isLongRunning });
-                }
-            }
-
-            if (steps.length === 0) {
-                this.addMessageToChat('assistant', '❌ No actionable steps were found in the plan. Please provide more specific requirements.');
-                return;
-            }
-
-            // Show total number of steps and estimated time
-            const longRunningSteps = steps.filter(s => s.isLongRunning).length;
-            const regularSteps = steps.length - longRunningSteps;
-            const estimatedTime = (regularSteps * 2 + longRunningSteps * 5) + ' minutes';
+            // Extract all file creation markers
+            const fileRegex = /###\s*([^\n]+)\s*\n([\s\S]*?)%%%/g;
             
-            this.addMessageToChat('assistant', `🚀 Implementation Plan:
-• Total Steps: ${steps.length}
-• Regular Steps: ${regularSteps}
-• Long-running Steps: ${longRunningSteps}
-• Estimated Time: ${estimatedTime}
+            const files = [...implementation.matchAll(fileRegex)].map(match => ({
+                path: match[1].trim(),
+                content: match[2].trim()
+            }));
 
-Starting implementation...`);
+            // Create all files
+            this.addMessageToChat('assistant', `📝 Creating website files...`);
             
-            for (let i = 0; i < steps.length; i++) {
-                const step = steps[i];
-                const stepNumber = i + 1;
-                const totalSteps = steps.length;
-                const progress = Math.round((stepNumber / totalSteps) * 100);
-                
-                this.addMessageToChat('assistant', `📝 Step ${stepNumber}/${totalSteps} (${progress}% complete)${step.isLongRunning ? ' [LONG-RUNNING]' : ''}:
-${step.content}
-
-Starting step execution...`);
-
-                // Create a promise that rejects after timeout
-                const timeoutPromise = new Promise((_, reject) => {
-                    setTimeout(() => reject(new Error('Step timeout')), 60000);
-                });
-
+            for (const file of files) {
                 try {
-                    // Race between step execution and timeout
-                    await Promise.race([
-                        this.executeStep(step, text, contextInfo, i),
-                        timeoutPromise
-                    ]);
-
-                    this.addMessageToChat('assistant', `✅ Step ${stepNumber}/${totalSteps} completed successfully`);
-                } catch (error: unknown) {
-                    if (error instanceof Error && error.message === 'Step timeout') {
-                        this.addMessageToChat('assistant', `⚠️ Step ${stepNumber} took too long (>1 minute). ${step.isLongRunning ? 'This is expected for long-running operations.' : 'This might indicate an issue.'}`);
-                    } else {
-                        this.addMessageToChat('assistant', `❌ Error in step ${stepNumber}: ${error instanceof Error ? error.message : 'Unknown error'}
-                        
-Attempting to recover...`);
-                        
-                        // Try to recover from the error
-                        const recovered = await this.handleStepError(step, error);
-                        if (!recovered) {
-                            this.addMessageToChat('assistant', `Failed to recover from error in step ${stepNumber}. Would you like to:
-1. Skip this step and continue
-2. Retry this step
-3. Stop execution
-
-Please respond with your choice (1, 2, or 3).`);
-                            return;
-                        }
-                    }
-                    continue;
-                }
-
-                // Add a progress update between steps
-                if (i < steps.length - 1) {
-                    const nextStep = steps[i + 1];
-                    this.addMessageToChat('assistant', `⏳ Progress: ${progress}% complete
-Next up: ${nextStep.isLongRunning ? '[LONG-RUNNING] ' : ''}Step ${stepNumber + 1}/${totalSteps}`);
-                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    await this.createFile(file.path, file.content);
+                    this.addMessageToChat('assistant', `✅ Created ${file.path}`);
+                    // Add a small delay after file creation
+                    await new Promise(resolve => setTimeout(resolve, 500));
+                } catch (error) {
+                    this.addMessageToChat('assistant', `❌ Error creating file ${file.path}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+                    throw error;
                 }
             }
 
-            // Final completion message with summary
-            this.addMessageToChat('assistant', `🎉 Implementation Complete!
+            // Final completion message
+            const completionTime = Math.round((Date.now() - startTime) / 1000);
+            this.addMessageToChat('assistant', `🎉 Website creation completed in ${completionTime} seconds!
 
-Summary:
-• Total Steps Completed: ${steps.length}
-• Regular Steps: ${regularSteps}
-• Long-running Steps: ${longRunningSteps}
-• Actual Time: ${Math.round((Date.now() - startTime) / 60000)} minutes
+Files created:
+${files.map(f => `• ${f.path}`).join('\n')}
 
-Next Steps:
-1. Review the implemented code
-2. Run the test suite
-3. Check for any warnings or potential improvements
-4. Document any known limitations or future enhancements
+The website includes:
+• Modern, semantic HTML structure
+• Extensive CSS styling and animations
+• Interactive JavaScript functionality
 
-Would you like me to help with any of these next steps?`);
-
-            // Log execution response
-            this.logger.log('AI_EXECUTION_RESPONSE', 'AI execution completion', { steps });
+You can now open the files to view and edit the code.`);
 
         } catch (error) {
             // Log errors
@@ -796,10 +694,15 @@ Current step to implement: ${step.content}
 Step type: ${step.isLongRunning ? 'LONG-RUNNING' : 'REGULAR'}
 
 Requirements:
-1. FIRST create all necessary files using ### filename.ext markers
-2. Include all required code, imports, and dependencies in the files
-3. Only after creating files, specify any necessary commands with $ prefix
-4. DO NOT create files that already exist, instead modify them if needed
+1. Create all necessary files using ### filename.ext markers
+1-You are a website developer and you do nothing else but creating the code for the website.
+2-Before step one you must reply with the plan that you will follow that doesnt include actual code but includes the steps and there discription.
+3-Step one MUST be creating the extensive and detailed  AND ONLY HTML code for the website it must be a minimum of 500 lines long DO NOT USE FILLERS OF ANY KIND, BE CREATIVE write in the step that the file will be at least 500 lines long.
+4-Step two MUST be creating the extensive and detailed CSS code for the website it must be a minimum of 1000 lines long DO NOT USE FILLERS OF ANY KIND, BE CREATIVE write in the step that the file will be at least 1000 lines long.
+4-Step three MUST be creating the extensive and detailed JS code for the website it must be a minimum of 300 lines long DO NOT USE FILLERS OF ANY KIND, BE CREATIVE write in the step that the file will be at least 300 lines long.
+5-Step for must be entahnsing the code and making it even more extensive and detailed.
+7-The website must have lots an lots of styles and a lot of animations and a lot of JS code DO NOT USE FILLERS OF ANY KIND, BE CREATIVE.
+
 
 File Creation Format:
 ### filename.ext
@@ -818,7 +721,7 @@ ${existingFiles.join('\n')}`;
             messages: [
                 { 
                     role: 'system', 
-                    content: 'You are a software developer. Create ALL files first, then list ALL commands. Never recreate existing files. Always wait for each operation to complete before starting the next. Use the provided context to understand the existing codebase.' 
+                    content: 'You are a software developer. Create files with detailed, well-structured code. Never recreate existing files. Use the provided context to understand the existing codebase.' 
                 },
                 { role: 'user', content: text },
                 { role: 'assistant', content: 'I will help implement this step of your request.' },
@@ -831,16 +734,13 @@ ${existingFiles.join('\n')}`;
 
         const implementation = executionCompletion.choices[0].message.content || '';
         
-        // Extract all file creation markers and commands
+        // Extract all file creation markers
         const fileRegex = /###\s*([^\n]+)\s*\n([\s\S]*?)%%%/g;
-        const commandRegex = /\$ (.*)/g;
         
         const files = [...implementation.matchAll(fileRegex)].map(match => ({
             path: match[1].trim(),
             content: match[2].trim()
         }));
-        
-        const commands = [...implementation.matchAll(commandRegex)].map(match => match[1]);
 
         // Log complete AI execution response including raw response
         this.logger.log('AI_EXECUTION_RESPONSE', 'AI execution completion', {
@@ -848,11 +748,10 @@ ${existingFiles.join('\n')}`;
             executionContent: executionCompletion.choices[0].message.content,
             model: executionCompletion.model,
             usage: executionCompletion.usage,
-            files: files,
-            commands: commands
+            files: files
         });
 
-        // FIRST: Process all files before executing any commands
+        // Process all files
         this.addMessageToChat('assistant', `📝 Creating ${files.length} files...`);
         
         for (const file of files) {
@@ -860,29 +759,9 @@ ${existingFiles.join('\n')}`;
                 await this.createFile(file.path, file.content);
                 // Add a small delay after file creation
                 await new Promise(resolve => setTimeout(resolve, 500));
-                
-                // Automatically include newly created files in context
             } catch (error) {
                 this.addMessageToChat('assistant', `❌ Error creating file ${file.path}: ${error instanceof Error ? error.message : 'Unknown error'}`);
-                throw error; // Rethrow to stop execution if file creation fails
-            }
-        }
-
-        // SECOND: Only after ALL files are created, execute commands
-        if (commands.length > 0) {
-            this.addMessageToChat('assistant', `⚡ Step ${stepIndex + 1}: Executing ${commands.length} commands...`);
-            
-            for (const command of commands) {
-                this.addMessageToChat('assistant', `🔄 Executing command: ${command}`);
-                const success = await this.executeCommandWithRetry(command);
-                
-                if (!success && !step.isLongRunning) {
-                    this.addMessageToChat('assistant', `❌ Command failed: ${command}`);
-                    throw new Error(`Command failed: ${command}`);
-                }
-                
-                // Add a delay between commands
-                await new Promise(resolve => setTimeout(resolve, 1000));
+                throw error;
             }
         }
 
@@ -1275,6 +1154,7 @@ console.log(greeting);
                     const helpToggle = document.getElementById('helpToggle');
                     const fileFormatHelp = document.getElementById('fileFormatHelp');
 
+                    // Event Listeners
                     helpToggle.addEventListener('click', () => {
                         const isHidden = fileFormatHelp.style.display === 'none';
                         fileFormatHelp.style.display = isHidden ? 'block' : 'none';
@@ -1310,24 +1190,22 @@ console.log(greeting);
                                 break;
                         }
                     });
+
+                    // Initialize UI
+                    function initializeUI() {
+                        // Initial scroll to bottom
+                        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                    }
+
+                    // Call initialization
+                    initializeUI();
                 </script>
             </body>
             </html>
         `;
     }
 
-    // Add cleanup method for terminals and command tracking
-    private cleanupTerminals() {
-        for (const [id, terminal] of this.activeTerminals) {
-            terminal.dispose();
-        }
-        this.activeTerminals.clear();
-        this.executedCommands.clear();
-    }
-
-    // Update deactivate to clean up terminals and save token counts
     public deactivate() {
-        this.cleanupTerminals();
         if (this.tokenCountPanel) {
             this.tokenCountPanel.dispose();
         }
@@ -1422,128 +1300,6 @@ console.log(greeting);
                 .trim();
             
             await this.createFile(filePath.trim(), cleanContent);
-        }
-    }
-
-    private async handleCommandFailure(command: string, error: string, output: string): Promise<boolean> {
-        try {
-            this.addMessageToChat('assistant', '🔍 Analyzing command failure and attempting recovery...');
-            
-            // Comprehensive error analysis instructions with FULL error context
-            const errorAnalysisInstructions = `
-Command failed: "${command}"
-Error message: "${error}"
-Error output: "${error}"
-Full output: "${output}"
-
-Analyze the error and suggest a solution. IMPORTANT:
-1. DO NOT suggest the exact same command that failed
-2. If suggesting a similar command, explain how it's different
-3. Focus on fixing the root cause of the error
-
-If code changes are needed, specify them using the following format:
-
-For file modifications:
-EDIT_FILE: filename
-START_BLOCK: [unique identifier or line number]
-[new code]
-END_BLOCK
-
-For new files:
-### filename.ext
-content
-%%%
-
-For commands:
-$ command
-
-Focus on:
-1. Understanding the root cause of the error
-2. Suggesting specific fixes that are different from the failed command
-3. Providing step-by-step recovery instructions`;
-
-            const errorAnalysis = await this.openai.chat.completions.create({
-                model: 'o3-mini',
-                messages: [
-                    { 
-                        role: 'system', 
-                        content: 'You are an error analysis and recovery expert. Never suggest the exact same command that failed. Always suggest alternative solutions.' 
-                    },
-                    { role: 'user', content: errorAnalysisInstructions }
-                ]
-            });
-
-            // Update token count
-            await this.updateTokenCount(errorAnalysis);
-
-            const solution = errorAnalysis.choices[0].message.content || '';
-            this.addMessageToChat('assistant', '💡 Suggested recovery plan:\n' + solution);
-
-            let recoverySuccessful = false;
-
-            // Process file edits first
-            const editMatches = solution.match(/EDIT_FILE:\s*([^\n]+)\nSTART_BLOCK:\s*([^\n]+)\n([\s\S]*?)\nEND_BLOCK/g);
-            if (editMatches) {
-                for (const match of editMatches) {
-                    const [_, file, blockId, newCode] = match.match(/EDIT_FILE:\s*([^\n]+)\nSTART_BLOCK:\s*([^\n]+)\n([\s\S]*?)\nEND_BLOCK/) || [];
-                    if (file && blockId && newCode) {
-                        try {
-                            await this.editFileBlock(file, blockId, newCode.trim());
-                            recoverySuccessful = true;
-                        } catch (error) {
-                            this.addMessageToChat('assistant', `⚠️ Failed to edit ${file}: ${error}`);
-                        }
-                    }
-                }
-            }
-
-            // Process new file creation
-            try {
-                await this.processFileCreationMarkers(solution);
-                recoverySuccessful = true;
-            } catch (error) {
-                this.addMessageToChat('assistant', `⚠️ Failed to create new files: ${error}`);
-            }
-
-            // Process recovery commands
-            const commandRegex = /\$ (.*)/g;
-            const recoveryCommands = [...solution.matchAll(commandRegex)].map(match => match[1]);
-            
-            if (recoveryCommands.length > 0) {
-                this.addMessageToChat('assistant', '🔧 Executing recovery commands:');
-                
-                // Filter out any commands that were already executed
-                const newCommands = recoveryCommands.filter(cmd => !this.executedCommands.has(cmd));
-                
-                if (newCommands.length === 0) {
-                    this.addMessageToChat('assistant', '⚠️ All suggested recovery commands have already been executed. Stopping to prevent loops.');
-                    return false;
-                }
-
-                const results = await Promise.all(newCommands.map(async cmd => {
-                    this.addMessageToChat('assistant', `📝 Running new command: ${cmd}`);
-                    return {
-                        command: cmd,
-                        success: await this.executeCommandWithRetry(cmd)
-                    };
-                }));
-
-                // Check if any recovery command succeeded
-                if (results.some(r => r.success)) {
-                    recoverySuccessful = true;
-                }
-            }
-
-            if (recoverySuccessful) {
-                this.addMessageToChat('assistant', '✅ Recovery steps completed successfully');
-                return true;
-            }
-
-            this.addMessageToChat('assistant', '❌ Recovery steps failed to resolve the issue');
-            return false;
-        } catch (error) {
-            this.addMessageToChat('assistant', `❌ Error during recovery: ${error}`);
-            return false;
         }
     }
 }
@@ -1953,6 +1709,25 @@ class FileViewProvider implements vscode.WebviewViewProvider {
                         return files;
                     }
 
+                    function handleDirectoryAction(content, isInclude) {
+                        const files = getAllFilesInDirectory(content);
+                        vscode.postMessage({
+                            type: 'toggleDirectoryContext',
+                            files: files,
+                            isIncluded: isInclude,
+                            isExcluded: !isInclude
+                        });
+                    }
+
+                    function handleFileAction(filePath, isInclude) {
+                        vscode.postMessage({
+                            type: 'toggleFileContext',
+                            path: filePath,
+                            isIncluded: isInclude,
+                            isExcluded: !isInclude
+                        });
+                    }
+
                     function createFileTree(tree, parentElement, path = '') {
                         // Handle directories
                         if (tree.dirs) {
@@ -1971,30 +1746,18 @@ class FileViewProvider implements vscode.WebviewViewProvider {
                                 const includeButton = document.createElement('span');
                                 includeButton.className = 'action-button include-button';
                                 includeButton.textContent = 'Include';
-                                includeButton.onclick = (e) => {
+                                includeButton.addEventListener('click', (e) => {
                                     e.stopPropagation();
-                                    const files = getAllFilesInDirectory(content);
-                                    vscode.postMessage({
-                                        type: 'toggleDirectoryContext',
-                                        files: files,
-                                        isIncluded: true,
-                                        isExcluded: false
-                                    });
-                                };
+                                    handleDirectoryAction(content, true);
+                                });
                                 
                                 const excludeButton = document.createElement('span');
                                 excludeButton.className = 'action-button exclude-button';
                                 excludeButton.textContent = 'Exclude';
-                                excludeButton.onclick = (e) => {
+                                excludeButton.addEventListener('click', (e) => {
                                     e.stopPropagation();
-                                    const files = getAllFilesInDirectory(content);
-                                    vscode.postMessage({
-                                        type: 'toggleDirectoryContext',
-                                        files: files,
-                                        isIncluded: false,
-                                        isExcluded: true
-                                    });
-                                };
+                                    handleDirectoryAction(content, false);
+                                });
                                 
                                 actionsDiv.appendChild(includeButton);
                                 actionsDiv.appendChild(excludeButton);
@@ -2042,28 +1805,18 @@ class FileViewProvider implements vscode.WebviewViewProvider {
                                 const includeButton = document.createElement('span');
                                 includeButton.className = 'action-button include-button';
                                 includeButton.textContent = 'Include';
-                                includeButton.onclick = (e) => {
+                                includeButton.addEventListener('click', (e) => {
                                     e.stopPropagation();
-                                    vscode.postMessage({
-                                        type: 'toggleFileContext',
-                                        path: file.path,
-                                        isIncluded: true,
-                                        isExcluded: false
-                                    });
-                                };
+                                    handleFileAction(file.path, true);
+                                });
                                 
                                 const excludeButton = document.createElement('span');
                                 excludeButton.className = 'action-button exclude-button';
                                 excludeButton.textContent = 'Exclude';
-                                excludeButton.onclick = (e) => {
+                                excludeButton.addEventListener('click', (e) => {
                                     e.stopPropagation();
-                                    vscode.postMessage({
-                                        type: 'toggleFileContext',
-                                        path: file.path,
-                                        isIncluded: false,
-                                        isExcluded: true
-                                    });
-                                };
+                                    handleFileAction(file.path, false);
+                                });
                                 
                                 actionsDiv.appendChild(includeButton);
                                 actionsDiv.appendChild(excludeButton);
@@ -2073,15 +1826,13 @@ class FileViewProvider implements vscode.WebviewViewProvider {
                                 fileDiv.appendChild(indicator);
                                 fileDiv.appendChild(actionsDiv);
                                 
-                                // Change single click to just select the file
+                                // Single click to select
                                 fileDiv.addEventListener('click', () => {
-                                    // Remove selected class from all files
                                     document.querySelectorAll('.file').forEach(f => f.classList.remove('selected'));
-                                    // Add selected class to this file
                                     fileDiv.classList.add('selected');
                                 });
 
-                                // Add double click to open file
+                                // Double click to open
                                 fileDiv.addEventListener('dblclick', () => {
                                     vscode.postMessage({
                                         type: 'openFile',

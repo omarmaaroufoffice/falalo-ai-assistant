@@ -351,19 +351,19 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
 
             // Set HTML content
             this._view.webview.html = this._getHtmlForWebview(nonce);
-            
-            // Set up message handler
-            this._view.webview.onDidReceiveMessage(async message => {
-                if (message.type === 'message') {
-                    await this.handleUserMessage(message.text);
-                }
-            });
+                
+                // Set up message handler
+                this._view.webview.onDidReceiveMessage(async message => {
+                    if (message.type === 'message') {
+                        await this.handleUserMessage(message.text);
+                    }
+                });
 
-            this._isInitialized = true;
-            this.logger.log('SYSTEM', 'Chat window initialized successfully');
-            
-            // Send initial message to chat
-            this.addMessageToChat('assistant', '👋 Hello! I\'m your AI assistant. How can I help you today?');
+                this._isInitialized = true;
+                this.logger.log('SYSTEM', 'Chat window initialized successfully');
+                
+                // Send initial message to chat
+                this.addMessageToChat('assistant', '👋 Hello! I\'m your AI assistant. How can I help you today?');
 
             // Add scroll to bottom for messages
             this._view.webview.postMessage({
@@ -415,7 +415,9 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
             
             // Get recovery suggestions from AI
             const recoveryCompletion = await this.openai.chat.completions.create({
-                model: 'o3-mini',
+                           model: 'o3-mini',
+            "reasoning_effort": "high",
+                
                 messages: [
                     { 
                         role: 'system', 
@@ -441,43 +443,43 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     private async refineUserPrompt(text: string): Promise<string> {
-        this.addMessageToChat('assistant', '🔄 Refining your website requirements...');
+        this.addMessageToChat('assistant', '🔄 Analyzing your program requirements...');
         
-        const refinementPrompt = `Act as a Prompt Refinement Engine for website creation. Expand the following user's input into a complete, detailed website specification. Make educated guesses for missing details and annotate assumptions with [ASSUMPTION].
+        const refinementPrompt = `Act as a Program Specification Engine. Expand the following user's input into a complete, detailed program specification. Make educated guesses for missing details and annotate assumptions with [ASSUMPTION].
 
 User's Input: "${text}"
 
 Instructions:
-1. Clarify the website's primary purpose and goals
-2. Define the target audience and their needs
-3. Specify design preferences (colors, typography, layout)
-4. List required pages and features
-5. Include technical requirements and SEO considerations
+1. Define the program's primary purpose and goals
+2. Specify the programming language and framework requirements
+3. List core features and functionality
+4. Detail data structures and algorithms needed
+5. Include error handling and edge cases
+6. Specify testing requirements
+7. Note performance considerations
+8. List all required files and their purposes
 
 Output Format:
-Your response MUST be wrapped with $$$ at the start and *** at the end.
-
-Example:
 $$$
-**Refined Website Specification**
+**Program Specification**
 - Purpose: [Main goal + use cases]
-- Audience: [Target users + needs]
-- Design:
-  - Colors: [Color scheme]
-  - Typography: [Font choices]
-  - Layout: [Structure preferences]
-- Content/Features: [Pages + functionalities]
-- Technical: [Framework + SEO + performance]
-***
-
-Keep the output organized and detailed. Flag any assumptions made.`;
+- Language/Framework: [Tech stack details]
+- Core Features: [Key functionalities]
+- Architecture: [Design patterns + structure]
+- Data Handling: [Data structures + algorithms]
+- Error Handling: [Edge cases + recovery]
+- Testing: [Test requirements]
+- Performance: [Optimization needs]
+- Files Required: [List of files + purposes]
+***`;
 
         const refinementCompletion = await this.openai.chat.completions.create({
-            model: 'o3-mini',
+                       model: 'o3-mini',
+            "reasoning_effort": "high",
             messages: [
                 { 
                     role: 'system', 
-                    content: 'You are an expert in website planning and requirements analysis. Help refine and expand website creation requests into detailed specifications. Always wrap your response with $$$ and ***.' 
+                    content: 'You are an expert in software architecture and program design. Help refine and expand program creation requests into detailed specifications.' 
                 },
                 { role: 'user', content: refinementPrompt }
             ]
@@ -485,228 +487,93 @@ Keep the output organized and detailed. Flag any assumptions made.`;
 
         const refinedSpec = refinementCompletion.choices[0].message.content || '';
         
-        // Extract the content between $$$ and ***
+        // Extract content between $$$ and ***
         const markerRegex = /\$\$\$([\s\S]*?)\*\*\*/;
         const match = refinedSpec.match(markerRegex);
         const cleanedSpec = match ? match[1].trim() : refinedSpec;
         
-        // Log the refinement
-        this.logger.log('PROMPT_REFINEMENT', 'Refined user prompt', {
+        this.logger.log('PROMPT_REFINEMENT', 'Refined program requirements', {
             originalPrompt: text,
             refinedSpec: cleanedSpec
         });
 
-        // Show the refined spec to the user with clear markers
-        this.addMessageToChat('assistant', `📋 I've refined your website requirements:
+        this.addMessageToChat('assistant', `📋 I've refined your program requirements:
 
 $$$
 ${cleanedSpec}
 ***
 
-Creating your website based on these specifications...`);
+Creating your program based on these specifications...`);
 
         return cleanedSpec;
     }
 
-    private async runAccessibilityTests(files: { path: string, content: string }[]): Promise<string> {
-        this.addMessageToChat('assistant', '🔍 Running accessibility tests...');
-        
-        // Use axe-core for accessibility testing
-        const testResults = await this.openai.chat.completions.create({
-            model: 'o3-mini',
-            messages: [
-                { 
-                    role: 'system', 
-                    content: 'You are an accessibility testing expert. Analyze the HTML, CSS, and JavaScript code for accessibility issues using WCAG 2.1 guidelines.' 
-                },
-                { 
-                    role: 'user', 
-                    content: `Analyze these website files for accessibility:\n\n${files.map(f => `File: ${f.path}\n${f.content}\n---\n`).join('\n')}` 
-                }
-            ]
-        });
-
-        const accessibilityReport = testResults.choices[0].message.content || '';
-        
-        this.addMessageToChat('assistant', `📋 Accessibility Report:\n${accessibilityReport}`);
-        return accessibilityReport;
-    }
-
-    private async captureWebsiteScreenshot(files: { path: string, content: string }[]): Promise<string> {
-        this.addMessageToChat('assistant', '📸 Generating website visualization...');
-        
-        // Create a visual description of the website using GPT-4
-        const visualizationCompletion = await this.openai.chat.completions.create({
-            model: 'gpt-4o-mini',
-            messages: [
-                { 
-                    role: 'system', 
-                    content: 'You are a visual design expert. Create a detailed visual description of the website based on its code, including layout, colors, components, and visual hierarchy.' 
-                },
-                { 
-                    role: 'user', 
-                    content: `Describe the visual appearance of this website:\n\n${files.map(f => `File: ${f.path}\n${f.content}\n---\n`).join('\n')}` 
-                }
-            ]
-        });
-
-        const visualDescription = visualizationCompletion.choices[0].message.content || '';
-        
-        this.addMessageToChat('assistant', `🎨 Visual Analysis:\n${visualDescription}`);
-        return visualDescription;
-    }
-
-    private async enhanceWebsite(
-        files: { path: string, content: string }[],
-        accessibilityReport: string,
-        visualAnalysis: string,
-        refinedSpec: string
-    ): Promise<{ path: string, content: string }[]> {
-        this.addMessageToChat('assistant', '🔄 Enhancing website based on analysis...');
-
-        const enhancementPrompt = `Enhance this website based on the following inputs:
-
-1. Original Specification:
+    private async generateProgram(refinedSpec: string, existingFiles: string[]): Promise<{ path: string, content: string }[]> {
+        const programInstructions = `Refined Program Specification:
 ${refinedSpec}
 
-2. Accessibility Report:
-${accessibilityReport}
-
-3. Visual Analysis:
-${visualAnalysis}
-
-4. Current Implementation:
-${files.map(f => `File: ${f.path}\n${f.content}\n---\n`).join('\n')}
-
-Requirements for enhancement:
-1. Address all accessibility issues
-2. Improve visual design based on the analysis
-3. Maintain or enhance all existing functionality
-4. Keep the same file structure
-5. Ensure responsive design
-6. Optimize performance
-7. Follow best practices for modern web development
-
-Generate enhanced versions of all files using this format:
-### filename.ext
-content
-%%%`;
-
-        const enhancementCompletion = await this.openai.chat.completions.create({
-            model: 'o3-mini',
-            messages: [
-                { 
-                    role: 'system', 
-                    content: 'You are a senior web developer specializing in accessibility, visual design, and web standards. Enhance website code while maintaining its core functionality.' 
-                },
-                { role: 'user', content: enhancementPrompt }
-            ]
-        });
-
-        const enhancedImplementation = enhancementCompletion.choices[0].message.content || '';
-        
-        // Extract enhanced files
-        const fileRegex = /^###([^\n]+)\n([\s\S]*?)^%%%$/gm;
-        const enhancedFiles = [...enhancedImplementation.matchAll(fileRegex)].map(match => ({
-            path: match[1].trim(),
-            content: match[2].trim()
-        }));
-
-        return enhancedFiles;
-    }
-
-    private async handleUserMessage(text: string) {
-        try {
-            if (!this._view) {
-                return;
-            }
-
-            // Log user request and start time
-            this.logger.log('USER_REQUEST', text);
-            const startTime = Date.now();
-
-            this.addMessageToChat('user', text);
-
-            // First, refine the user's prompt
-            const refinedSpec = await this.refineUserPrompt(text);
-
-            // Extract the actual specification (in case it still has markers)
-            const markerRegex = /\$\$\$([\s\S]*?)\*\*\*/;
-            const match = refinedSpec.match(markerRegex);
-            const finalSpec = match ? match[1].trim() : refinedSpec;
-
-            const includedFiles = this.contextManager.getIncludedFiles();
-            const excludedFiles = this.contextManager.getExcludedFiles();
-
-            // Build context with actual file contents
-            let contextInfo = '';
-            if (includedFiles.length > 0) {
-                contextInfo += '\nIncluded files and their contents:\n';
-                for (const file of includedFiles) {
-                    try {
-                        if (!vscode.workspace.workspaceFolders) continue;
-                        const fullPath = path.join(vscode.workspace.workspaceFolders[0].uri.fsPath, file);
-                        if (fs.existsSync(fullPath)) {
-                            const content = await fs.promises.readFile(fullPath, 'utf8');
-                            contextInfo += `\nFile: ${file}\nContent:\n${content}\n---\n`;
-                        }
-                    } catch (error) {
-                        this.logger.log('CONTEXT_ERROR', `Error reading file ${file}`, error);
-                    }
-                }
-            }
-            if (excludedFiles.length > 0) {
-                contextInfo += '\nExcluded files from context:\n' + excludedFiles.join('\n');
-            }
-
-            // Get all existing files in workspace
-            const workspaceRoot = vscode.workspace.workspaceFolders![0].uri.fsPath;
-            const existingFiles = await glob.glob('**/*', { 
-                cwd: workspaceRoot,
-                nodir: true,
-                ignore: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**']
-            });
-
-            const websiteInstructions = `Refined Website Specification:
-${finalSpec}
-
-You are a website developer tasked with creating a complete, modern, and beautiful website based on the above specifications. Generate all necessary files in a single response.
+You are a senior software developer tasked with creating a complete, production-ready program based on the above specifications. Generate all necessary files in a single response.
 
 Requirements:
+1. Create ALL necessary program files with extensive, non-filler content
+2. Each file must be properly structured and well-documented
+3. Include proper error handling and logging
+4. Add comprehensive comments explaining complex logic
+5. Follow best practices for the chosen programming language
+6. Include necessary configuration files
+7. MUST include a detailed README.md and REQUIREMENTS.md
+8. NO PLACEHOLDER OR FILLER CODE
+9. Each file must be at least 300 lines long (except config and documentation files)
+10. Include extensive functionality and features
+11. Add proper tests with full coverage
+12. Include proper documentation
 
-1. Create three files with extensive, non-filler content:
-   - index.html (minimum 500 lines)
-   - styles.css (minimum 1000 lines)
-   - script.js (minimum 600 lines)
+Documentation Requirements:
+1. README.md must include:
+   - Project overview and purpose
+   - Detailed setup instructions
+   - Usage examples with code snippets
+   - Configuration options
+   - API documentation if applicable
+   - Troubleshooting guide
+   - Contributing guidelines
+   - License information
 
-HTML Requirements (index.html):
-- Modern semantic structure with multiple sections
-- Responsive layout with flexbox/grid
-- Interactive forms and components
-- Proper meta tags and SEO elements
-- Beautiful and professional design
-- Extensive content sections
-- NO PLACEHOLDER CONTENT
+2. REQUIREMENTS.md must include:
+   - List of all dependencies and versions
+   - System requirements (OS, hardware, etc.)
+   - Required environment variables
+   - Required external services or APIs
+   - Setup prerequisites
+   - Known limitations or issues
+   - Future improvements needed
+   - Security considerations
+   - Performance requirements
+   - Any missing features that need implementation
 
-CSS Requirements (styles.css):
-- Modern design patterns and layouts
-- Complex animations and transitions
-- Comprehensive responsive design
-- Custom properties (CSS variables)
-- Advanced selectors and hover states
-- Multiple breakpoints
-- Beautiful color schemes
-- NO FILLER STYLES
-
-JavaScript Requirements (script.js):
-- Modern ES6+ features
-- Interactive UI components
-- Form validation
-- Smooth animations
-- Event handling
-- DOM manipulation
-- State management
+Code Quality Requirements:
+- Clean, maintainable code structure
+- Proper separation of concerns
+- Efficient algorithms and data structures
+- Comprehensive error handling
+- Well-documented functions and classes
+- Proper naming conventions
 - NO FILLER FUNCTIONS
+- Extensive feature implementation
+- Complex business logic handling
+- Advanced error recovery
+- Performance optimizations
+- Security best practices
+
+Testing Requirements:
+- Unit tests for all components
+- Integration tests for all features
+- End-to-end test scenarios
+- Performance tests
+- Security tests
+- Edge case handling
+- Test utilities and helpers
+- NO DUMMY TESTS
 
 IMPORTANT - File Creation Format:
 For each file, you MUST use this EXACT format:
@@ -716,36 +583,268 @@ For each file, you MUST use this EXACT format:
 4. NO additional text, markdown, or formatting around the code
 
 Example of correct format:
-###index.html
-<!DOCTYPE html>
-<html>
-...actual code...
-</html>
+###src/main.py
+def main():
+    # Your code here
+    pass
+
+if __name__ == "__main__":
+    main()
 %%%
 
-###styles.css
-/* Your CSS code */
-...actual code...
+###README.md
+# Project Title
+Project description and setup instructions
 %%%
 
-Workspace context:${contextInfo}
+###REQUIREMENTS.md
+# Project Requirements
+List of all requirements and missing features
+%%%
 
 Existing files (DO NOT recreate these):
 ${existingFiles.join('\n')}
 
-Focus on creating a cohesive, professional website with extensive functionality and modern design that matches the refined specifications exactly.`;
+Focus on creating a complete, production-ready program that exactly matches the refined specifications.`;
+
+        const completion = await this.openai.chat.completions.create({
+                       model: 'o3-mini',
+            "reasoning_effort": "high",
+            messages: [
+                { 
+                    role: 'system', 
+                    content: 'You are an exceptional software developer with deep knowledge of software architecture, design patterns, and best practices. Create detailed, well-structured implementations with excellent code quality.' 
+                },
+                { role: 'user', content: programInstructions }
+            ]
+        });
+
+        const implementation = completion.choices[0].message.content || '';
+        
+        // Extract all file creation markers
+        const fileRegex = /^###([^\n]+)\n([\s\S]*?)^%%%$/gm;
+        
+        return [...implementation.matchAll(fileRegex)].map(match => ({
+            path: match[1].trim(),
+            content: match[2].trim()
+        }));
+    }
+
+    private async analyzeCode(files: { path: string, content: string }[]): Promise<string> {
+        this.addMessageToChat('assistant', '🔍 Analyzing code quality and structure...');
+        
+        const analysisCompletion = await this.openai.chat.completions.create({
+                       model: 'o3-mini',
+            "reasoning_effort": "high",
+            messages: [
+                { 
+                    role: 'system', 
+                    content: 'You are a code quality expert. Analyze the program code for best practices, potential improvements, and optimization opportunities.' 
+                },
+                { 
+                    role: 'user', 
+                    content: `Analyze this program code:\n\n${files.map(f => `File: ${f.path}\n${f.content}\n---\n`).join('\n')}` 
+                }
+            ]
+        });
+
+        const analysis = analysisCompletion.choices[0].message.content || '';
+        
+        this.addMessageToChat('assistant', `📊 Code Analysis:\n${analysis}`);
+        return analysis;
+    }
+
+    private async enhanceProgram(
+        files: { path: string, content: string }[],
+        codeAnalysis: string,
+        refinedSpec: string
+    ): Promise<{ path: string, content: string }[]> {
+        this.addMessageToChat('assistant', '🔄 Enhancing program based on analysis...');
+
+        const enhancementPrompt = `Enhance this program based on the following inputs:
+
+1. Original Specification:
+${refinedSpec}
+
+2. Code Analysis:
+${codeAnalysis}
+
+3. Current Implementation:
+${files.map(f => `File: ${f.path}\n${f.content}\n---\n`).join('\n')}
+
+Requirements for enhancement:
+1. Improve code quality and structure
+2. Optimize performance where possible
+3. Enhance error handling and recovery
+4. Add or improve documentation
+5. Implement suggested improvements from analysis
+6. Maintain or enhance all existing functionality
+7. Keep the same file structure
+8. Follow best practices for the programming language
+
+Generate enhanced versions of all files using this format:
+### filename.ext
+content
+%%%`;
+
+        const enhancementCompletion = await this.openai.chat.completions.create({
+                       model: 'o3-mini',
+            "reasoning_effort": "high",
+            messages: [
+                { 
+                    role: 'system', 
+                    content: 'You are a senior software developer specializing in code optimization and best practices. Enhance program code while maintaining its core functionality.' 
+                },
+                { role: 'user', content: enhancementPrompt }
+            ]
+        });
+
+        const enhancedImplementation = enhancementCompletion.choices[0].message.content || '';
+        
+        const fileRegex = /^###([^\n]+)\n([\s\S]*?)^%%%$/gm;
+        return [...enhancedImplementation.matchAll(fileRegex)].map(match => ({
+            path: match[1].trim(),
+            content: match[2].trim()
+        }));
+    }
+
+    private async handleUserMessage(text: string) {
+        try {
+            if (!this._view) {
+                return;
+            }
+
+            this.logger.log('USER_REQUEST', text);
+            const startTime = Date.now();
+
+            this.addMessageToChat('user', text);
+
+            // First, refine the user's prompt
+            const refinedSpec = await this.refineUserPrompt(text);
+
+            // Extract the actual specification
+            const markerRegex = /\$\$\$([\s\S]*?)\*\*\*/;
+            const match = refinedSpec.match(markerRegex);
+            const finalSpec = match ? match[1].trim() : refinedSpec;
+
+            // Get existing files in workspace
+            const workspaceRoot = vscode.workspace.workspaceFolders![0].uri.fsPath;
+            const existingFiles = await glob.glob('**/*', { 
+                cwd: workspaceRoot,
+                nodir: true,
+                ignore: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**']
+            });
+
+            const programInstructions = `Refined Program Specification:
+${finalSpec}
+
+You are a senior software developer tasked with creating a complete, production-ready program based on the above specifications. Generate all necessary files in a single response.
+
+Requirements:
+1. Create ALL necessary program files with extensive, non-filler content
+2. Each file must be properly structured and well-documented
+3. Include proper error handling and logging
+4. Add comprehensive comments explaining complex logic
+5. Follow best practices for the chosen programming language
+6. Include necessary configuration files
+7. MUST include a detailed README.md and REQUIREMENTS.md
+8. NO PLACEHOLDER OR FILLER CODE
+9. Each file must be at least 300 lines long (except config and documentation files)
+10. Include extensive functionality and features
+11. Add proper tests with full coverage
+12. Include proper documentation
+
+Documentation Requirements:
+1. README.md must include:
+   - Project overview and purpose
+   - Detailed setup instructions
+   - Usage examples with code snippets
+   - Configuration options
+   - API documentation if applicable
+   - Troubleshooting guide
+   - Contributing guidelines
+   - License information
+
+2. REQUIREMENTS.md must include:
+   - List of all dependencies and versions
+   - System requirements (OS, hardware, etc.)
+   - Required environment variables
+   - Required external services or APIs
+   - Setup prerequisites
+   - Known limitations or issues
+   - Future improvements needed
+   - Security considerations
+   - Performance requirements
+   - Any missing features that need implementation
+
+Code Quality Requirements:
+- Clean, maintainable code structure
+- Proper separation of concerns
+- Efficient algorithms and data structures
+- Comprehensive error handling
+- Well-documented functions and classes
+- Proper naming conventions
+- NO FILLER FUNCTIONS
+- Extensive feature implementation
+- Complex business logic handling
+- Advanced error recovery
+- Performance optimizations
+- Security best practices
+
+Testing Requirements:
+- Unit tests for all components
+- Integration tests for all features
+- End-to-end test scenarios
+- Performance tests
+- Security tests
+- Edge case handling
+- Test utilities and helpers
+- NO DUMMY TESTS
+
+IMPORTANT - File Creation Format:
+For each file, you MUST use this EXACT format:
+1. Start with ### followed immediately by the filename on the same line
+2. On the next line, start the actual code content
+3. End with %%% on its own line
+4. NO additional text, markdown, or formatting around the code
+
+Example of correct format:
+###src/main.py
+def main():
+    # Your code here
+    pass
+
+if __name__ == "__main__":
+    main()
+%%%
+
+###README.md
+# Project Title
+Project description and setup instructions
+%%%
+
+###REQUIREMENTS.md
+# Project Requirements
+List of all requirements and missing features
+%%%
+
+Existing files (DO NOT recreate these):
+${existingFiles.join('\n')}
+
+Focus on creating a complete, production-ready program that exactly matches the refined specifications.`;
 
             // Get implementation from AI
             const completion = await this.openai.chat.completions.create({
-                model: 'o3-mini',
+                           model: 'o3-mini',
+            "reasoning_effort": "high",
                 messages: [
                     { 
                         role: 'system', 
-                        content: 'You are an exceptional website developer with deep knowledge of modern web development, design patterns, and best practices. Create detailed, well-structured implementations with excellent code quality.' 
+                        content: 'You are an exceptional software developer with deep knowledge of software architecture, design patterns, and best practices. Create detailed, well-structured implementations with excellent code quality.' 
                     },
                     { role: 'user', content: text },
-                    { role: 'assistant', content: 'I will create a complete, modern website with extensive HTML, CSS, and JavaScript.' },
-                    { role: 'user', content: websiteInstructions }
+                    { role: 'assistant', content: 'I will create a complete, production-ready program with extensive functionality.' },
+                    { role: 'user', content: programInstructions }
                 ]
             });
 
@@ -762,7 +861,7 @@ Focus on creating a cohesive, professional website with extensive functionality 
 
             const implementation = completion.choices[0].message.content || '';
             
-            // Extract all file creation markers with strict pattern
+            // Extract all file creation markers
             const fileRegex = /^###([^\n]+)\n([\s\S]*?)^%%%$/gm;
             
             const files = [...implementation.matchAll(fileRegex)].map(match => ({
@@ -770,48 +869,32 @@ Focus on creating a cohesive, professional website with extensive functionality 
                 content: match[2].trim()
             }));
 
-            // Create initial files
-            this.addMessageToChat('assistant', `📝 Creating initial website files...`);
+            // Create all files
+            this.addMessageToChat('assistant', '📝 Creating program files...');
             for (const file of files) {
                 await this.createFile(file.path, file.content);
                 this.addMessageToChat('assistant', `✅ Created ${file.path}`);
                 await new Promise(resolve => setTimeout(resolve, 500));
             }
 
-            // Run accessibility tests
-            const accessibilityReport = await this.runAccessibilityTests(files);
-
-            // Generate visual analysis
-            const visualAnalysis = await this.captureWebsiteScreenshot(files);
-
-            // Enhance website based on analysis
-            const enhancedFiles = await this.enhanceWebsite(files, accessibilityReport, visualAnalysis, finalSpec);
-
-            // Create enhanced files
-            this.addMessageToChat('assistant', `📝 Creating enhanced website files...`);
-            for (const file of enhancedFiles) {
-                await this.createFile(file.path, file.content);
-                this.addMessageToChat('assistant', `✅ Enhanced ${file.path}`);
-                await new Promise(resolve => setTimeout(resolve, 500));
-            }
-
             // Final completion message
             const completionTime = Math.round((Date.now() - startTime) / 1000);
-            this.addMessageToChat('assistant', `🎉 Website creation and enhancement completed in ${completionTime} seconds!
+            this.addMessageToChat('assistant', `🎉 Program creation completed in ${completionTime} seconds!
 
-Initial files created:
+Files created:
 ${files.map(f => `• ${f.path}`).join('\n')}
 
-Enhancements made:
-• Improved accessibility based on WCAG 2.1 guidelines
-• Enhanced visual design and user experience
-• Optimized code structure and performance
-• Added better responsive design handling
+Program features:
+• Complete implementation of all requirements
+• Comprehensive error handling
+• Extensive test coverage
+• Performance optimizations
+• Security best practices
+• Detailed documentation
 
-You can now open the files to view and edit the enhanced code.`);
+You can now open the files to view and edit the code.`);
 
         } catch (error) {
-            // Log errors
             this.logger.log('ERROR', 'Error in handleUserMessage', error);
             vscode.window.showErrorMessage(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
             this.addMessageToChat('assistant', '❌ An error occurred while processing your request.');
@@ -844,19 +927,91 @@ Current step to implement: ${step.content}
 Step type: ${step.isLongRunning ? 'LONG-RUNNING' : 'REGULAR'}
 
 Requirements:
-1. Create all necessary files using ### filename.ext markers
-1-You are a website developer and you do nothing else but creating the code for the website.
-2-Before step one you must reply with the plan that you will follow that doesnt include actual code but includes the steps and there discription.
-3-Step one MUST be creating the extensive and detailed  AND ONLY HTML code for the website it must be a minimum of 500 lines long DO NOT USE FILLERS OF ANY KIND, BE CREATIVE write in the step that the file will be at least 500 lines long.
-4-Step two MUST be creating the extensive and detailed CSS code for the website it must be a minimum of 1000 lines long DO NOT USE FILLERS OF ANY KIND, BE CREATIVE write in the step that the file will be at least 1000 lines long.
-4-Step three MUST be creating the extensive and detailed JS code for the website it must be a minimum of 300 lines long DO NOT USE FILLERS OF ANY KIND, BE CREATIVE write in the step that the file will be at least 300 lines long.
-5-Step for must be entahnsing the code and making it even more extensive and detailed.
-7-The website must have lots an lots of styles and a lot of animations and a lot of JS code DO NOT USE FILLERS OF ANY KIND, BE CREATIVE.
+1. Create ALL necessary program files with extensive, non-filler content
+2. Each file must be properly structured and well-documented
+3. Include proper error handling and logging
+4. Add comprehensive comments explaining complex logic
+5. Follow best practices for the chosen programming language
+6. Include necessary configuration files
+7. MUST include a detailed README.md and REQUIREMENTS.md
+8. NO PLACEHOLDER OR FILLER CODE
+9. Each file must be at least 300 lines long (except config and documentation files)
+10. Include extensive functionality and features
+11. Add proper tests with full coverage
+12. Include proper documentation
 
+Documentation Requirements:
+1. README.md must include:
+   - Project overview and purpose
+   - Detailed setup instructions
+   - Usage examples with code snippets
+   - Configuration options
+   - API documentation if applicable
+   - Troubleshooting guide
+   - Contributing guidelines
+   - License information
 
-File Creation Format:
-### filename.ext
-content
+2. REQUIREMENTS.md must include:
+   - List of all dependencies and versions
+   - System requirements (OS, hardware, etc.)
+   - Required environment variables
+   - Required external services or APIs
+   - Setup prerequisites
+   - Known limitations or issues
+   - Future improvements needed
+   - Security considerations
+   - Performance requirements
+   - Any missing features that need implementation
+
+Code Quality Requirements:
+- Clean, maintainable code structure
+- Proper separation of concerns
+- Efficient algorithms and data structures
+- Comprehensive error handling
+- Well-documented functions and classes
+- Proper naming conventions
+- NO FILLER FUNCTIONS
+- Extensive feature implementation
+- Complex business logic handling
+- Advanced error recovery
+- Performance optimizations
+- Security best practices
+
+Testing Requirements:
+- Unit tests for all components
+- Integration tests for all features
+- End-to-end test scenarios
+- Performance tests
+- Security tests
+- Edge case handling
+- Test utilities and helpers
+- NO DUMMY TESTS
+
+IMPORTANT - File Creation Format:
+For each file, you MUST use this EXACT format:
+1. Start with ### followed immediately by the filename on the same line
+2. On the next line, start the actual code content
+3. End with %%% on its own line
+4. NO additional text, markdown, or formatting around the code
+
+Example of correct format:
+###src/main.py
+def main():
+    # Your code here
+    pass
+
+if __name__ == "__main__":
+    main()
+%%%
+
+###README.md
+# Project Title
+Project description and setup instructions
+%%%
+
+###REQUIREMENTS.md
+# Project Requirements
+List of all requirements and missing features
 %%%
 
 Workspace context:${contextInfo}
@@ -867,7 +1022,8 @@ ${existingFiles.join('\n')}`;
 
         // Get implementation from AI with full context
         const executionCompletion = await this.openai.chat.completions.create({
-            model: 'o3-mini',
+                       model: 'o3-mini',
+            "reasoning_effort": "high",
             messages: [
                 { 
                     role: 'system', 
@@ -891,7 +1047,7 @@ ${existingFiles.join('\n')}`;
             path: match[1].trim(),
             content: match[2].trim()
         }));
-
+        
         // Log complete AI execution response including raw response
         this.logger.log('AI_EXECUTION_RESPONSE', 'AI execution completion', {
             rawResponse: executionCompletion,

@@ -5,6 +5,93 @@ import { minimatch } from 'minimatch';
 import * as fs from 'fs';
 import * as path from 'path';
 
+class Logger {
+    private logFile: string;
+    private logStream: fs.WriteStream;
+    private readonly maxLineLength: number = 1000; // Maximum characters per line
+
+    constructor(workspaceRoot: string) {
+        // Create logs directory if it doesn't exist
+        const logsDir = path.join(workspaceRoot, 'logs');
+        if (!fs.existsSync(logsDir)) {
+            fs.mkdirSync(logsDir, { recursive: true });
+        }
+
+        // Create a new log file with timestamp
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        this.logFile = path.join(logsDir, `ai-interaction-${timestamp}.log`);
+        this.logStream = fs.createWriteStream(this.logFile, { flags: 'a' });
+
+        // Log initial creation
+        this.log('SYSTEM', 'Logging session started');
+    }
+
+    private breakLongLines(str: string): string {
+        if (!str || typeof str !== 'string') return str;
+        
+        const lines = str.split('\n');
+        return lines.map(line => {
+            if (line.length <= this.maxLineLength) return line;
+            
+            // Break long line into chunks
+            const chunks = [];
+            let currentIndex = 0;
+            
+            while (currentIndex < line.length) {
+                // Try to break at a space if possible
+                let breakPoint = currentIndex + this.maxLineLength;
+                if (breakPoint < line.length) {
+                    const lastSpace = line.lastIndexOf(' ', breakPoint);
+                    if (lastSpace > currentIndex && lastSpace - currentIndex >= this.maxLineLength / 2) {
+                        breakPoint = lastSpace;
+                    }
+                }
+                
+                chunks.push(line.substring(currentIndex, breakPoint));
+                currentIndex = breakPoint;
+                
+                // If not at the end, add continuation marker
+                if (currentIndex < line.length) {
+                    chunks[chunks.length - 1] += ' ⏎';
+                }
+            }
+            
+            return chunks.join('\n  '); // Indent continuation lines
+        }).join('\n');
+    }
+
+    private processLogData(data: any): any {
+        if (typeof data === 'string') {
+            return this.breakLongLines(data);
+        } else if (Array.isArray(data)) {
+            return data.map(item => this.processLogData(item));
+        } else if (data && typeof data === 'object') {
+            const processed: any = {};
+            for (const [key, value] of Object.entries(data)) {
+                processed[key] = this.processLogData(value);
+            }
+            return processed;
+        }
+        return data;
+    }
+
+    public log(type: string, message: string, data?: any) {
+        const timestamp = new Date().toISOString();
+        const logEntry = {
+            timestamp,
+            type,
+            message: this.breakLongLines(message),
+            data: data ? this.processLogData(data) : undefined
+        };
+
+        this.logStream.write(JSON.stringify(logEntry, null, 2) + '\n---\n');
+    }
+
+    public close() {
+        this.logStream.end();
+    }
+}
+
 class ContextManager {
     private includedFiles: Set<string> = new Set();
     private excludedFiles: Set<string> = new Set();
@@ -90,20 +177,32 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     private tokenCount: { input: number, output: number } = { input: 0, output: 0 };
     private tokenCountPanel?: vscode.WebviewPanel;
     private executedCommands: Set<string> = new Set();
+    private logger: Logger;
+    private _isInitialized: boolean = false;  // Add initialization tracking
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
         private readonly _extensionContext: vscode.ExtensionContext,
         private readonly contextManager: ContextManager
     ) {
+        if (!vscode.workspace.workspaceFolders) {
+            throw new Error('No workspace folder is open');
+        }
+        const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
+        this.logger = new Logger(workspaceRoot);
+
         const config = vscode.workspace.getConfiguration('falalo');
         const apiKey = config.get('openaiApiKey', '');
+        
+        if (!apiKey) {
+            vscode.window.showErrorMessage('OpenAI API key is not configured. Please set it in the extension settings.');
+        }
+
         this.openai = new OpenAI({
             apiKey: apiKey,
             dangerouslyAllowBrowser: true
         });
 
-        // Load saved token counts from extension context
         const savedTokenCount = this._extensionContext.globalState.get('tokenCount') as { input: number, output: number } | undefined;
         if (savedTokenCount && typeof savedTokenCount.input === 'number' && typeof savedTokenCount.output === 'number') {
             this.tokenCount = savedTokenCount;
@@ -119,12 +218,15 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
             { viewColumn: vscode.ViewColumn.Three, preserveFocus: true },
             {
                 enableScripts: true,
-                retainContextWhenHidden: true
+                retainContextWhenHidden: true,
+                enableCommandUris: false,
+                localResourceRoots: [this._extensionUri]
             }
         );
 
-        // Add reset button to panel
-        this.updateTokenCountPanel();
+        // Set strict Content-Security-Policy
+        const nonce = getNonce();
+        this.updateTokenCountPanelContent(nonce);
 
         // Handle messages from the webview
         this.tokenCountPanel.webview.onDidReceiveMessage(async message => {
@@ -134,12 +236,13 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
         });
     }
 
-    private updateTokenCountPanel() {
+    private updateTokenCountPanelContent(nonce: string) {
         if (this.tokenCountPanel) {
             this.tokenCountPanel.webview.html = `
                 <!DOCTYPE html>
                 <html>
                 <head>
+                    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}' 'unsafe-eval'; img-src https: data:; connect-src https:; font-src https:;">
                     <style>
                         body {
                             padding: 20px;
@@ -195,7 +298,7 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
                         </div>
                     </div>
                     <button class="reset-button" onclick="resetTokens()">Reset Token Count</button>
-                    <script>
+                    <script nonce="${nonce}">
                         const vscode = acquireVsCodeApi();
                         function resetTokens() {
                             vscode.postMessage({ command: 'resetTokens' });
@@ -216,7 +319,7 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
             // Save updated counts to extension context
             await this._extensionContext.globalState.update('tokenCount', this.tokenCount);
             
-            this.updateTokenCountPanel();
+            this.updateTokenCountPanelContent(getNonce());
         }
     }
 
@@ -224,11 +327,52 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     private async resetTokenCount() {
         this.tokenCount = { input: 0, output: 0 };
         await this._extensionContext.globalState.update('tokenCount', this.tokenCount);
-        this.updateTokenCountPanel();
+        this.updateTokenCountPanelContent(getNonce());
     }
 
     public setFileViewProvider(provider: FileViewProvider) {
         this.fileViewProvider = provider;
+    }
+
+    private async initializeWebview() {
+        try {
+            if (!this._view) {
+                this.logger.log('ERROR', 'View is not initialized');
+                return;
+            }
+
+            // Set strict Content-Security-Policy
+            const nonce = getNonce();
+            this._view.webview.options = {
+                enableScripts: true,
+                enableCommandUris: false,
+                localResourceRoots: [this._extensionUri]
+            };
+
+            // Set HTML content
+            this._view.webview.html = this._getHtmlForWebview(nonce);
+            
+            // Set up message handler
+            this._view.webview.onDidReceiveMessage(async message => {
+                if (message.type === 'message') {
+                    await this.handleUserMessage(message.text);
+                }
+            });
+
+            this._isInitialized = true;
+            this.logger.log('SYSTEM', 'Chat window initialized successfully');
+            
+            // Send initial message to chat
+            this.addMessageToChat('assistant', '👋 Hello! I\'m your AI assistant. How can I help you today?');
+
+            // Add scroll to bottom for messages
+            this._view.webview.postMessage({
+                type: 'scrollToBottom'
+            });
+        } catch (error) {
+            this.logger.log('ERROR', 'Failed to initialize chat window', error);
+            vscode.window.showErrorMessage(`Failed to initialize chat window: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
     }
 
     public resolveWebviewView(
@@ -240,218 +384,127 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
 
         webviewView.webview.options = {
             enableScripts: true,
-            localResourceRoots: [
-                this._extensionUri
-            ]
+            enableCommandUris: false,
+            localResourceRoots: [this._extensionUri]
         };
 
-        webviewView.webview.html = this._getHtmlForWebview();
-        
-        // Initial file list update
-        if (this.fileViewProvider) {
-            this.fileViewProvider.updateFileList();
-        }
+        // Set strict Content-Security-Policy
+        const nonce = getNonce();
+        webviewView.webview.html = this._getHtmlForWebview(nonce);
 
-        // Set up file system watcher with more specific patterns
-        const watchers = [
-            vscode.workspace.createFileSystemWatcher('**/*.*'),  // Watch all files
-            vscode.workspace.createFileSystemWatcher('**/'),     // Watch directories
-        ];
+        // Initialize the webview
+        this.initializeWebview();
 
-        // Set up event handlers for each watcher
-        watchers.forEach(watcher => {
-            watcher.onDidCreate(() => {
-                console.log('File created, updating list...');
-                if (this.fileViewProvider) {
-                    this.fileViewProvider.updateFileList();
-                }
-            });
-            watcher.onDidDelete(() => {
-                console.log('File deleted, updating list...');
-                if (this.fileViewProvider) {
-                    this.fileViewProvider.updateFileList();
-                }
-            });
-            watcher.onDidChange(() => {
-                console.log('File changed, updating list...');
-                if (this.fileViewProvider) {
-                    this.fileViewProvider.updateFileList();
-                }
-            });
-
-            // Add watcher to be disposed when the extension is deactivated
-            if (this._extensionContext && this._extensionContext.subscriptions) {
-                this._extensionContext.subscriptions.push(watcher);
+        // Handle visibility changes
+        webviewView.onDidChangeVisibility(() => {
+            if (webviewView.visible && !this._isInitialized) {
+                this.initializeWebview();
             }
         });
 
-        // Handle messages from the webview
-        webviewView.webview.onDidReceiveMessage(async message => {
-            switch (message.type) {
-                case 'openFile':
-                    try {
-                        // Ensure the file path is within the workspace
-                        if (!vscode.workspace.workspaceFolders) {
-                            throw new Error('No workspace folder is open');
-                        }
-                        const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
-                        const fullPath = path.join(workspaceRoot, message.path);
-                        
-                        // Check if file exists before trying to open it
-                        if (!fs.existsSync(fullPath)) {
-                            throw new Error(`File does not exist: ${message.path}`);
-                        }
-                        
-                        // Create VS Code URI for the file
-                        const fileUri = vscode.Uri.file(fullPath);
-                        
-                        // Try to open the document
-                        const document = await vscode.workspace.openTextDocument(fileUri);
-                        await vscode.window.showTextDocument(document);
-                    } catch (error) {
-                        vscode.window.showErrorMessage(`Failed to open file: ${error instanceof Error ? error.message : 'Unknown error'}`);
-                    }
-                    break;
-                case 'toggleFileContext':
-                    try {
-                        if (message.isIncluded) {
-                            await this.contextManager.includeFile(message.path);
-                            vscode.window.showInformationMessage(`Added ${message.path} to context`);
-                        } else if (message.isExcluded) {
-                            this.contextManager.excludeFile(message.path);
-                            vscode.window.showInformationMessage(`Excluded ${message.path} from context`);
-                        } else {
-                            this.contextManager.excludeFile(message.path);
-                            vscode.window.showInformationMessage(`Removed ${message.path} from context`);
-                        }
-                        if (this.fileViewProvider) {
-                            this.fileViewProvider.updateFileList();
-                        }
-                    } catch (error) {
-                        vscode.window.showErrorMessage((error as Error).message);
-                    }
-                    break;
-                case 'toggleDirectoryContext':
-                    try {
-                        const files = message.files;
-                        if (message.isIncluded) {
-                            for (const file of files) {
-                                await this.contextManager.includeFile(file);
-                            }
-                            vscode.window.showInformationMessage(`Added directory contents to context`);
-                        } else if (message.isExcluded) {
-                            for (const file of files) {
-                                this.contextManager.excludeFile(file);
-                            }
-                            vscode.window.showInformationMessage(`Excluded directory contents from context`);
-                        } else {
-                            for (const file of files) {
-                                this.contextManager.excludeFile(file);
-                            }
-                            vscode.window.showInformationMessage(`Removed directory contents from context`);
-                        }
-                        if (this.fileViewProvider) {
-                            this.fileViewProvider.updateFileList();
-                        }
-                    } catch (error) {
-                        vscode.window.showErrorMessage((error as Error).message);
-                    }
-                    break;
-            }
+        // Handle disposal
+        webviewView.onDidDispose(() => {
+            this._isInitialized = false;
+            this.logger.log('SYSTEM', 'Chat window disposed');
         });
     }
 
     private async executeCommandWithRetry(command: string, retryCount = 0): Promise<boolean> {
-        // Check if command was already executed to prevent loops
-        if (this.executedCommands.has(command)) {
-            this.addMessageToChat('assistant', `⚠️ Skipping command that was already executed: ${command}`);
-            return false;
+        // Log command execution attempt
+        this.logger.log('COMMAND_EXECUTION', `Executing command (attempt ${retryCount + 1})`, { command });
+
+        if (!vscode.workspace.workspaceFolders) {
+            throw new Error('No workspace folder is open');
         }
-        this.executedCommands.add(command);
+
+        const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
 
         try {
             return new Promise<boolean>((resolve) => {
                 const terminalId = `Falalo-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-                let outputBuffer = '';
-                let errorBuffer = '';
-
-                // Create write streams for output and error logging
-                const outputPath = `/tmp/${terminalId}_output`;
-                const errorPath = `/tmp/${terminalId}_error`;
-                const exitCodePath = `/tmp/${terminalId}_exit_code`;
-
+                
+                // Create terminal with proper working directory
                 const terminal = vscode.window.createTerminal({
                     name: terminalId,
-                    shellPath: process.platform === 'win32' ? 'cmd.exe' : '/bin/bash'
+                    shellPath: process.platform === 'win32' ? 'cmd.exe' : '/bin/bash',
+                    cwd: workspaceRoot
                 });
 
                 this.activeTerminals.set(terminalId, terminal);
 
-                // Detect if this is a long-running command (like npm run dev)
+                // Detect if this is a long-running command
                 const isLongRunningCommand = command.match(/(npm run (dev|start|serve)|ng serve|python manage\.py runserver|rails s|yarn (start|dev)|docker-compose up)/i);
 
-                // For long-running commands, we don't wait for completion
+                // For long-running commands
                 if (isLongRunningCommand) {
+                    this.logger.log('COMMAND_LONG_RUNNING', 'Starting long-running command', { command, terminalId });
                     this.addMessageToChat('assistant', `🚀 Starting long-running command in terminal ${terminalId}:\n${command}`);
                     terminal.show(true);
+                    
+                    // First ensure we're in the right directory
+                    terminal.sendText(`cd "${workspaceRoot}"`);
                     terminal.sendText(command);
+                    
                     resolve(true);
                     return;
                 }
 
-                // For regular commands, we monitor execution and handle errors
+                // For regular commands
+                const outputPath = path.join(workspaceRoot, `.output_${terminalId}`);
+                const errorPath = path.join(workspaceRoot, `.error_${terminalId}`);
+                const exitCodePath = path.join(workspaceRoot, `.exitcode_${terminalId}`);
+
+                // Set up command completion detection
                 const disposable = vscode.window.onDidCloseTerminal(async closedTerminal => {
                     if (closedTerminal === terminal) {
                         disposable.dispose();
                         this.activeTerminals.delete(terminalId);
+
                         try {
-                            // Read all captured output
-                            const fs = require('fs');
+                            // Read command output
                             const [output, errors, exitCodeStr] = await Promise.all([
                                 fs.promises.readFile(outputPath, 'utf8').catch(() => ''),
                                 fs.promises.readFile(errorPath, 'utf8').catch(() => ''),
                                 fs.promises.readFile(exitCodePath, 'utf8').catch(() => '1')
                             ]);
 
-                            const actualExitCode = parseInt(exitCodeStr.trim(), 10);
-                            
-                            // Combine output and errors for context
-                            const fullOutput = `OUTPUT:\n${output}\n\nERRORS:\n${errors}`;
-                            this.terminalOutput = `${this.terminalOutput}\n$ ${command} (Terminal: ${terminalId})\n${fullOutput}\nExit code: ${actualExitCode}\n`;
-
-                            if (actualExitCode !== 0) {
-                                this.addMessageToChat('assistant', `⚠️ Command failed with exit code ${actualExitCode}. Output:\n${fullOutput}`);
-                                
-                                if (retryCount < this.maxRetries - 1) {
-                                    // Get AI suggestion before retrying - only pass error message
-                                    const recovered = await this.handleCommandFailure(command, errors, output);
-                                    if (recovered) {
-                                        resolve(true);
-                                        return;
-                                    }
-
-                                    this.addMessageToChat('assistant', `Retrying (attempt ${retryCount + 2}/${this.maxRetries})...`);
-                                    await new Promise(resolve => setTimeout(resolve, 2000));
-                                    const success = await this.executeCommandWithRetry(command, retryCount + 1);
-                                    resolve(success);
-                                } else {
-                                    this.addMessageToChat('assistant', `❌ Command failed after ${this.maxRetries} attempts. Full output:\n${fullOutput}`);
-                                    resolve(false);
-                                }
-                            } else {
-                                this.addMessageToChat('assistant', `✅ Command executed successfully in terminal ${terminalId}\nOutput:\n${fullOutput}`);
-                                resolve(true);
-                            }
-
-                            // Cleanup temp files
+                            // Clean up temp files
                             await Promise.all([
                                 fs.promises.unlink(outputPath).catch(() => {}),
                                 fs.promises.unlink(errorPath).catch(() => {}),
                                 fs.promises.unlink(exitCodePath).catch(() => {})
                             ]);
 
+                            const actualExitCode = parseInt(exitCodeStr.trim(), 10);
+                            const fullOutput = `OUTPUT:\n${output}\n\nERRORS:\n${errors}`;
+                            
+                            // Update terminal output history
+                            this.terminalOutput = `${this.terminalOutput}\n$ ${command} (Terminal: ${terminalId})\n${fullOutput}\nExit code: ${actualExitCode}\n`;
+
+                            if (actualExitCode === 0) {
+                                this.logger.log('COMMAND_SUCCESS', 'Command executed successfully', { 
+                                    command, 
+                                    terminalId, 
+                                    output: fullOutput 
+                                });
+                                resolve(true);
+                            } else {
+                                this.logger.log('COMMAND_FAILURE', 'Command failed', { 
+                                    command, 
+                                    terminalId, 
+                                    exitCode: actualExitCode, 
+                                    output: fullOutput 
+                                });
+                                
+                                // Try to recover from failure
+                                const recovered = await this.handleCommandFailure(command, errors, fullOutput);
+                                resolve(recovered);
+                            }
                         } catch (error) {
-                            this.addMessageToChat('assistant', `⚠️ Error processing command output: ${error}`);
+                            this.logger.log('COMMAND_ERROR', 'Error processing command output', { 
+                                command, 
+                                error: error instanceof Error ? error.message : 'Unknown error' 
+                            });
                             resolve(false);
                         }
                     }
@@ -459,16 +512,50 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
 
                 terminal.show(true);
                 
-                // Wrap command to capture both stdout and stderr separately and ensure proper completion
+                // Ensure we're in the right directory and capture all output
                 const wrappedCommand = process.platform === 'win32' 
-                    ? `${command} > "${outputPath}" 2> "${errorPath}" & echo %ERRORLEVEL% > "${exitCodePath}" & exit`
-                    : `${command} > "${outputPath}" 2> "${errorPath}"; echo $? > "${exitCodePath}"; exit`;
+                    ? `cd "${workspaceRoot}" && ${command} > "${outputPath}" 2> "${errorPath}" & echo %ERRORLEVEL% > "${exitCodePath}" & exit`
+                    : `cd "${workspaceRoot}" && ${command} > "${outputPath}" 2> "${errorPath}"; echo $? > "${exitCodePath}"; exit`;
                 
                 this.addMessageToChat('assistant', `🚀 Executing command in terminal ${terminalId}:\n${command}`);
                 terminal.sendText(wrappedCommand);
             });
         } catch (error) {
-            this.addMessageToChat('assistant', `⚠️ Error executing command: ${error}`);
+            this.logger.log('COMMAND_ERROR', 'Error executing command', { 
+                command, 
+                error: error instanceof Error ? error.message : 'Unknown error' 
+            });
+            return false;
+        }
+    }
+
+    private async handleStepError(step: {content: string, isLongRunning: boolean}, error: unknown): Promise<boolean> {
+        try {
+            this.logger.log('STEP_ERROR', 'Attempting to recover from step error', { step, error });
+            
+            // Get recovery suggestions from AI
+            const recoveryCompletion = await this.openai.chat.completions.create({
+                model: 'o3-mini',
+                messages: [
+                    { 
+                        role: 'system', 
+                        content: 'You are an expert in error recovery and debugging. Analyze errors and suggest specific recovery steps.' 
+                    },
+                    { 
+                        role: 'user', 
+                        content: `Step content: ${step.content}\nError: ${error instanceof Error ? error.message : 'Unknown error'}\n\nSuggest specific recovery steps.` 
+                    }
+                ]
+            });
+
+            const recoverySuggestions = recoveryCompletion.choices[0].message.content || '';
+            this.addMessageToChat('assistant', `Recovery suggestions:\n${recoverySuggestions}`);
+
+            // Try to automatically implement recovery steps
+            // This is a simplified version - you might want to make this more sophisticated
+            return false; // For now, we'll let the user decide what to do
+        } catch (recoveryError) {
+            this.logger.log('RECOVERY_ERROR', 'Failed to get recovery suggestions', recoveryError);
             return false;
         }
     }
@@ -479,17 +566,31 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
                 return;
             }
 
-            // Add step timeout constant
-            const STEP_TIMEOUT_MS = 60000; // 1 minute
+            // Log user request and start time
+            this.logger.log('USER_REQUEST', text);
+            const startTime = Date.now();
 
             this.addMessageToChat('user', text);
 
             const includedFiles = this.contextManager.getIncludedFiles();
             const excludedFiles = this.contextManager.getExcludedFiles();
 
+            // Build context with actual file contents
             let contextInfo = '';
             if (includedFiles.length > 0) {
-                contextInfo += '\nIncluded files in context:\n' + includedFiles.join('\n');
+                contextInfo += '\nIncluded files and their contents:\n';
+                for (const file of includedFiles) {
+                    try {
+                        if (!vscode.workspace.workspaceFolders) continue;
+                        const fullPath = path.join(vscode.workspace.workspaceFolders[0].uri.fsPath, file);
+                        if (fs.existsSync(fullPath)) {
+                            const content = await fs.promises.readFile(fullPath, 'utf8');
+                            contextInfo += `\nFile: ${file}\nContent:\n${content}\n---\n`;
+                        }
+                    } catch (error) {
+                        this.logger.log('CONTEXT_ERROR', `Error reading file ${file}`, error);
+                    }
+                }
             }
             if (excludedFiles.length > 0) {
                 contextInfo += '\nExcluded files from context:\n' + excludedFiles.join('\n');
@@ -500,24 +601,28 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
                 contextInfo += '\nRecent terminal activity:\n' + this.terminalOutput;
             }
 
-            // Stage 1: Planning Phase
+            // Stage 1: Planning Phase with improved instructions
             const planningInstructions = `User request: "${text}"
 
 <CURRENT_CURSOR_POSITION>
-Create a clear, step-by-step implementation plan.
-IMPORTANT: 
-1. Number each step clearly as "Step 1:", "Step 2:", etc.
-2. Mark steps that contain long-running commands with [LONG-RUNNING] prefix
-3. Group related commands together in the same step
+Create a clear, step-by-step implementation plan focusing on:
+
+1-THE ACTUAL USER REQUEST AND THE CONTEXT OF THE WORKSPACE AND THE ACUTAL CODE, YOUR  JOB IS TO FOCUS ON THE CREATING AND UPDATING AND IMPORVING THE CODE.
+2-Divide the code creation into steps, each step should be a single file or a small group of files.
+3-Make the code extensive and detailed.
+4-always make it look good.
+5-Do not execute a single command untill you have created all the files and improved the code.
+6-Execute the commands only after you have created all the files and improved the code.
+7-EXECUTING COMMNANDS IS ONLY ALLOWED IN THE LAST 2 STEPS
+
+Number each step clearly as "Step 1:", "Step 2:", etc.
+Mark long-running operations with [LONG-RUNNING] prefix
+Group related operations together
 
 Workspace context:${contextInfo}
 
 Focus on:
-1-Creating the actual files and code
-2-Making it look good
-3-Making it extensive and detailed
-4-Making sure all the pathways are correct
-5-Properly handling errors and output from commands`;
+1. MAKING THE ACTUAL CODE AND MAKING IT EXTENSIVE AND DETAILED AND LOOK GOOD`;
 
             // Get plan from AI
             const planCompletion = await this.openai.chat.completions.create({
@@ -525,12 +630,20 @@ Focus on:
                 messages: [
                     { 
                         role: 'system', 
-                        content: 'You are a software development planner. Number each step clearly as "Step 1:", "Step 2:", etc. Mark steps with long-running commands using [LONG-RUNNING] prefix.' 
+                        content: 'You are an exceptional software architect with deep knowledge of clean code, design patterns, and software engineering best practices. Create detailed, well-structured implementations with excellent code quality and comprehensive documentation.' 
                     },
                     { role: 'user', content: text },
-                    { role: 'assistant', content: 'I will help you with that. Let me create a clear, numbered plan.' },
+                    { role: 'assistant', content: 'I will help create a robust and well-architected implementation.' },
                     { role: 'user', content: planningInstructions }
                 ],
+            });
+
+            // Log complete AI planning response including raw response
+            this.logger.log('AI_PLAN_RESPONSE', 'AI planning completion', {
+                rawResponse: planCompletion,
+                planContent: planCompletion.choices[0].message.content,
+                model: planCompletion.model,
+                usage: planCompletion.usage
             });
 
             // Update token count
@@ -556,20 +669,37 @@ Focus on:
             }
 
             if (steps.length === 0) {
-                this.addMessageToChat('assistant', '❌ No actionable steps were found in the plan. Let me try again with a clearer format.');
+                this.addMessageToChat('assistant', '❌ No actionable steps were found in the plan. Please provide more specific requirements.');
                 return;
             }
 
-            // Show total number of steps
-            this.addMessageToChat('assistant', `🚀 Found ${steps.length} steps to execute...`);
+            // Show total number of steps and estimated time
+            const longRunningSteps = steps.filter(s => s.isLongRunning).length;
+            const regularSteps = steps.length - longRunningSteps;
+            const estimatedTime = (regularSteps * 2 + longRunningSteps * 5) + ' minutes';
+            
+            this.addMessageToChat('assistant', `🚀 Implementation Plan:
+• Total Steps: ${steps.length}
+• Regular Steps: ${regularSteps}
+• Long-running Steps: ${longRunningSteps}
+• Estimated Time: ${estimatedTime}
+
+Starting implementation...`);
             
             for (let i = 0; i < steps.length; i++) {
                 const step = steps[i];
-                this.addMessageToChat('assistant', `📝 Step ${i + 1}/${steps.length}${step.isLongRunning ? ' [LONG-RUNNING]' : ''}: ${step.content}`);
+                const stepNumber = i + 1;
+                const totalSteps = steps.length;
+                const progress = Math.round((stepNumber / totalSteps) * 100);
+                
+                this.addMessageToChat('assistant', `📝 Step ${stepNumber}/${totalSteps} (${progress}% complete)${step.isLongRunning ? ' [LONG-RUNNING]' : ''}:
+${step.content}
+
+Starting step execution...`);
 
                 // Create a promise that rejects after timeout
                 const timeoutPromise = new Promise((_, reject) => {
-                    setTimeout(() => reject(new Error('Step timeout')), STEP_TIMEOUT_MS);
+                    setTimeout(() => reject(new Error('Step timeout')), 60000);
                 });
 
                 try {
@@ -578,26 +708,63 @@ Focus on:
                         this.executeStep(step, text, contextInfo, i),
                         timeoutPromise
                     ]);
+
+                    this.addMessageToChat('assistant', `✅ Step ${stepNumber}/${totalSteps} completed successfully`);
                 } catch (error: unknown) {
                     if (error instanceof Error && error.message === 'Step timeout') {
-                        this.addMessageToChat('assistant', `⚠️ Step ${i + 1} took too long (>1 minute). Moving to next step...`);
+                        this.addMessageToChat('assistant', `⚠️ Step ${stepNumber} took too long (>1 minute). ${step.isLongRunning ? 'This is expected for long-running operations.' : 'This might indicate an issue.'}`);
                     } else {
-                        this.addMessageToChat('assistant', `❌ Error in step ${i + 1}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+                        this.addMessageToChat('assistant', `❌ Error in step ${stepNumber}: ${error instanceof Error ? error.message : 'Unknown error'}
+                        
+Attempting to recover...`);
+                        
+                        // Try to recover from the error
+                        const recovered = await this.handleStepError(step, error);
+                        if (!recovered) {
+                            this.addMessageToChat('assistant', `Failed to recover from error in step ${stepNumber}. Would you like to:
+1. Skip this step and continue
+2. Retry this step
+3. Stop execution
+
+Please respond with your choice (1, 2, or 3).`);
+                            return;
+                        }
                     }
-                    // Continue to next step regardless of error
                     continue;
                 }
 
-                // Add a small delay between steps for better visibility
+                // Add a progress update between steps
                 if (i < steps.length - 1) {
-                    this.addMessageToChat('assistant', `⏳ Transitioning to step ${i + 2}...`);
+                    const nextStep = steps[i + 1];
+                    this.addMessageToChat('assistant', `⏳ Progress: ${progress}% complete
+Next up: ${nextStep.isLongRunning ? '[LONG-RUNNING] ' : ''}Step ${stepNumber + 1}/${totalSteps}`);
                     await new Promise(resolve => setTimeout(resolve, 1000));
                 }
             }
 
-            // Final completion message
-            this.addMessageToChat('assistant', '🎉 All steps have been completed!');
+            // Final completion message with summary
+            this.addMessageToChat('assistant', `🎉 Implementation Complete!
+
+Summary:
+• Total Steps Completed: ${steps.length}
+• Regular Steps: ${regularSteps}
+• Long-running Steps: ${longRunningSteps}
+• Actual Time: ${Math.round((Date.now() - startTime) / 60000)} minutes
+
+Next Steps:
+1. Review the implemented code
+2. Run the test suite
+3. Check for any warnings or potential improvements
+4. Document any known limitations or future enhancements
+
+Would you like me to help with any of these next steps?`);
+
+            // Log execution response
+            this.logger.log('AI_EXECUTION_RESPONSE', 'AI execution completion', { steps });
+
         } catch (error) {
+            // Log errors
+            this.logger.log('ERROR', 'Error in handleUserMessage', error);
             vscode.window.showErrorMessage(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
             this.addMessageToChat('assistant', '❌ An error occurred while processing your request.');
         }
@@ -632,10 +799,7 @@ Requirements:
 1. FIRST create all necessary files using ### filename.ext markers
 2. Include all required code, imports, and dependencies in the files
 3. Only after creating files, specify any necessary commands with $ prefix
-4. Use TypeScript/JavaScript where possible
-5. Add error handling and logging
-6. Follow security practices
-7. DO NOT create files that already exist, instead modify them if needed
+4. DO NOT create files that already exist, instead modify them if needed
 
 File Creation Format:
 ### filename.ext
@@ -654,7 +818,7 @@ ${existingFiles.join('\n')}`;
             messages: [
                 { 
                     role: 'system', 
-                    content: 'You are a software developer. Create ALL files first, then list ALL commands. Never recreate existing files. Always wait for each operation to complete before starting the next.' 
+                    content: 'You are a software developer. Create ALL files first, then list ALL commands. Never recreate existing files. Always wait for each operation to complete before starting the next. Use the provided context to understand the existing codebase.' 
                 },
                 { role: 'user', content: text },
                 { role: 'assistant', content: 'I will help implement this step of your request.' },
@@ -678,25 +842,26 @@ ${existingFiles.join('\n')}`;
         
         const commands = [...implementation.matchAll(commandRegex)].map(match => match[1]);
 
+        // Log complete AI execution response including raw response
+        this.logger.log('AI_EXECUTION_RESPONSE', 'AI execution completion', {
+            rawResponse: executionCompletion,
+            executionContent: executionCompletion.choices[0].message.content,
+            model: executionCompletion.model,
+            usage: executionCompletion.usage,
+            files: files,
+            commands: commands
+        });
+
         // FIRST: Process all files before executing any commands
-        this.addMessageToChat('assistant', `📝 Step ${stepIndex + 1}: Creating ${files.length} files...`);
+        this.addMessageToChat('assistant', `📝 Creating ${files.length} files...`);
         
         for (const file of files) {
-            const fullPath = path.join(workspaceRoot, file.path);
-            const relativePath = path.relative(workspaceRoot, fullPath);
-
-            // Check if file already exists
-            if (existingFiles.includes(relativePath)) {
-                this.addMessageToChat('assistant', `⚠️ File already exists: ${file.path} - Skipping creation`);
-                continue;
-            }
-
             try {
                 await this.createFile(file.path, file.content);
-                // Add the newly created file to our tracking
-                existingFiles.push(relativePath);
                 // Add a small delay after file creation
                 await new Promise(resolve => setTimeout(resolve, 500));
+                
+                // Automatically include newly created files in context
             } catch (error) {
                 this.addMessageToChat('assistant', `❌ Error creating file ${file.path}: ${error instanceof Error ? error.message : 'Unknown error'}`);
                 throw error; // Rethrow to stop execution if file creation fails
@@ -725,8 +890,13 @@ ${existingFiles.join('\n')}`;
     }
 
     private async createFile(filePath: string, content: string) {
+        // Log file creation attempt
+        this.logger.log('FILE_CREATION', 'Attempting to create file', { filePath });
+
         if (!vscode.workspace.workspaceFolders) {
-            throw new Error('No workspace folder is open');
+            const error = 'No workspace folder is open';
+            this.logger.log('FILE_ERROR', error, { filePath });
+            throw new Error(error);
         }
 
         const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
@@ -734,66 +904,72 @@ ${existingFiles.join('\n')}`;
 
         // Check if file already exists
         if (fs.existsSync(fullPath)) {
+            // Log file existence check
+            this.logger.log('FILE_EXISTS', 'File already exists, checking content', { 
+                filePath,
+                fullPath 
+            });
+
             // Read existing file content
             const existingContent = await fs.promises.readFile(fullPath, 'utf8');
             const existingLength = existingContent.trim().length;
             const newLength = content.trim().length;
 
             if (newLength <= existingLength) {
-                const errorMessage = `
-⚠️ File already exists: ${filePath}
-The new code (${newLength} chars) is not longer than the existing code (${existingLength} chars).
-
-To modify this file, please use one of these methods:
-1. Block modification:
-   EDIT_FILE: ${filePath}
-   START_BLOCK: [block_identifier]
-   your new code
-   END_BLOCK
-
-2. Line number modification:
-   EDIT_FILE: ${filePath}
-   START_BLOCK: [line_number]
-   your new code
-   END_BLOCK
-
-3. For multiple blocks:
-   EDIT_FILE: ${filePath}
-   START_BLOCK: block1
-   your new code
-   END_BLOCK
-   START_BLOCK: block2
-   more new code
-   END_BLOCK
-
-Please ensure your changes improve the code quality and functionality.`;
-            
+                const errorMessage = `File exists and new content is not longer: ${filePath}`;
+                this.logger.log('FILE_SKIP', errorMessage, {
+                    filePath,
+                    existingLength,
+                    newLength
+                });
                 this.addMessageToChat('assistant', errorMessage);
-                throw new Error(`File exists and new content is not longer: ${filePath}`);
+                throw new Error(errorMessage);
             } else {
-                this.addMessageToChat('assistant', `📝 Replacing existing file with longer version (${newLength} vs ${existingLength} chars): ${filePath}`);
+                this.logger.log('FILE_UPDATE', 'Replacing existing file with longer version', {
+                    filePath,
+                    existingLength,
+                    newLength
+                });
             }
         }
 
-        // Create directory if it doesn't exist
-        await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
+        try {
+            // Create directory if it doesn't exist
+            await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
 
-        // Write file content
-        await fs.promises.writeFile(fullPath, content);
+            // Write file content
+            await fs.promises.writeFile(fullPath, content);
 
-        // Automatically include the new file in context
-        await this.contextManager.includeFile(filePath);
+            // Log successful file creation/update
+            this.logger.log('FILE_SUCCESS', 'File operation successful', {
+                filePath,
+                fullPath,
+                action: fs.existsSync(fullPath) ? 'updated' : 'created'
+            });
 
-        // Show success message
-        this.addMessageToChat('assistant', `✅ ${fs.existsSync(fullPath) ? 'Updated' : 'Created'} file: ${filePath}`);
+            // Automatically include the new file in context
+            await this.contextManager.includeFile(filePath);
 
-        // Open the file in editor (one at a time)
-        const document = await vscode.workspace.openTextDocument(fullPath);
-        await vscode.window.showTextDocument(document, { preview: true });
+            // Show success message
+            this.addMessageToChat('assistant', `✅ ${fs.existsSync(fullPath) ? 'Updated' : 'Created'} file: ${filePath}`);
 
-        // Update the file tree view
-        if (this.fileViewProvider) {
-            await this.fileViewProvider.updateFileList();
+            // Open the file in editor (one at a time)
+            const document = await vscode.workspace.openTextDocument(fullPath);
+            await vscode.window.showTextDocument(document, { preview: true });
+
+            // Update the file tree view
+            if (this.fileViewProvider) {
+                await this.fileViewProvider.updateFileList();
+            }
+
+        } catch (error) {
+            // Log file operation error
+            this.logger.log('FILE_ERROR', 'Error during file operation', {
+                filePath,
+                fullPath,
+                error: error instanceof Error ? error.message : 'Unknown error'
+            });
+            throw error;
         }
     }
 
@@ -819,13 +995,14 @@ Please ensure your changes improve the code quality and functionality.`;
             .replace(/'/g, "&#039;");
     }
 
-    private _getHtmlForWebview() {
+    private _getHtmlForWebview(nonce: string) {
         return `
             <!DOCTYPE html>
             <html lang="en">
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}' 'unsafe-eval'; img-src https: data:; connect-src https:; font-src https:;">
                 <title>Falalo AI Chat</title>
                 <style>
                     :root {
@@ -1090,7 +1267,7 @@ console.log(greeting);
                         <button id="sendButton">Send</button>
                     </div>
                 </div>
-                <script>
+                <script nonce="${nonce}">
                     const vscode = acquireVsCodeApi();
                     const messagesDiv = document.getElementById('messages');
                     const userInput = document.getElementById('userInput');
@@ -1128,6 +1305,9 @@ console.log(greeting);
                                 messagesDiv.appendChild(messageDiv);
                                 messagesDiv.scrollTop = messagesDiv.scrollHeight;
                                 break;
+                            case 'scrollToBottom':
+                                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                                break;
                         }
                     });
                 </script>
@@ -1153,6 +1333,96 @@ console.log(greeting);
         }
         // Save final token counts
         this._extensionContext.globalState.update('tokenCount', this.tokenCount);
+        // Close logger
+        this.logger.close();
+    }
+
+    private async editFileBlock(filePath: string, blockIdentifier: string, newCode: string) {
+        try {
+            if (!vscode.workspace.workspaceFolders) {
+                throw new Error('No workspace folder is open');
+            }
+
+            const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
+            const fullPath = path.join(workspaceRoot, filePath);
+
+            // Verify file exists
+            if (!fs.existsSync(fullPath)) {
+                throw new Error(`File does not exist: ${filePath}`);
+            }
+
+            // Read existing file content
+            const content = await fs.promises.readFile(fullPath, 'utf8');
+            let newContent = content;
+            let edited = false;
+
+            // Try to identify the block
+            if (blockIdentifier.match(/^\d+$/)) {
+                // Line number based replacement
+                const lines = content.split('\n');
+                const lineNum = parseInt(blockIdentifier, 10);
+                if (lineNum > 0 && lineNum <= lines.length) {
+                    if (lines[lineNum - 1] === newCode) {
+                        this.addMessageToChat('assistant', `⚠️ No changes needed for line ${lineNum} in ${filePath}`);
+                        return;
+                    }
+                    lines[lineNum - 1] = newCode;
+                    newContent = lines.join('\n');
+                    edited = true;
+                } else {
+                    throw new Error(`Invalid line number ${lineNum} for file ${filePath}`);
+                }
+            } else {
+                // Block identifier based replacement
+                const blockRegex = new RegExp(`// BEGIN ${blockIdentifier}[\\s\\S]*?// END ${blockIdentifier}`, 'g');
+                const newBlock = `// BEGIN ${blockIdentifier}\n${newCode}\n// END ${blockIdentifier}`;
+                
+                if (!content.match(blockRegex)) {
+                    throw new Error(`Block "${blockIdentifier}" not found in ${filePath}`);
+                }
+
+                const updatedContent = content.replace(blockRegex, newBlock);
+                if (updatedContent === content) {
+                    this.addMessageToChat('assistant', `⚠️ No changes needed for block "${blockIdentifier}" in ${filePath}`);
+                    return;
+                }
+                newContent = updatedContent;
+                edited = true;
+            }
+
+            if (edited) {
+                // Write updated content
+                await fs.promises.writeFile(fullPath, newContent);
+                
+                // Show success message
+                this.addMessageToChat('assistant', `✅ Updated ${blockIdentifier} in ${filePath}`);
+
+                // Open the file in editor
+                const document = await vscode.workspace.openTextDocument(fullPath);
+                await vscode.window.showTextDocument(document);
+            }
+        } catch (error) {
+            throw new Error(`Failed to edit file ${filePath}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+    }
+
+    private async processFileCreationMarkers(text: string) {
+        const fileRegex = /###\s*([^\n]+)\s*\n([\s\S]*?)%%%/g;
+        let match;
+
+        while ((match = fileRegex.exec(text)) !== null) {
+            const [_, filePath, content] = match;
+            // Clean up the content by removing markdown code block markers
+            const cleanContent = content
+                .trim()
+                .replace(/^```[\w-]*\n/gm, '') // Remove opening code block markers
+                .replace(/```$/gm, '')         // Remove closing code block markers
+                .replace(/^`{1,2}[\w-]*\n/gm, '') // Remove inline code markers
+                .replace(/`{1,2}$/gm, '')         // Remove closing inline code markers
+                .trim();
+            
+            await this.createFile(filePath.trim(), cleanContent);
+        }
     }
 
     private async handleCommandFailure(command: string, error: string, output: string): Promise<boolean> {
@@ -1276,94 +1546,6 @@ Focus on:
             return false;
         }
     }
-
-    private async editFileBlock(filePath: string, blockIdentifier: string, newCode: string) {
-        try {
-            if (!vscode.workspace.workspaceFolders) {
-                throw new Error('No workspace folder is open');
-            }
-
-            const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
-            const fullPath = path.join(workspaceRoot, filePath);
-
-            // Verify file exists
-            if (!fs.existsSync(fullPath)) {
-                throw new Error(`File does not exist: ${filePath}`);
-            }
-
-            // Read existing file content
-            const content = await fs.promises.readFile(fullPath, 'utf8');
-            let newContent = content;
-            let edited = false;
-
-            // Try to identify the block
-            if (blockIdentifier.match(/^\d+$/)) {
-                // Line number based replacement
-                const lines = content.split('\n');
-                const lineNum = parseInt(blockIdentifier, 10);
-                if (lineNum > 0 && lineNum <= lines.length) {
-                    if (lines[lineNum - 1] === newCode) {
-                        this.addMessageToChat('assistant', `⚠️ No changes needed for line ${lineNum} in ${filePath}`);
-                        return;
-                    }
-                    lines[lineNum - 1] = newCode;
-                    newContent = lines.join('\n');
-                    edited = true;
-                } else {
-                    throw new Error(`Invalid line number ${lineNum} for file ${filePath}`);
-                }
-            } else {
-                // Block identifier based replacement
-                const blockRegex = new RegExp(`// BEGIN ${blockIdentifier}[\\s\\S]*?// END ${blockIdentifier}`, 'g');
-                const newBlock = `// BEGIN ${blockIdentifier}\n${newCode}\n// END ${blockIdentifier}`;
-                
-                if (!content.match(blockRegex)) {
-                    throw new Error(`Block "${blockIdentifier}" not found in ${filePath}`);
-                }
-
-                const updatedContent = content.replace(blockRegex, newBlock);
-                if (updatedContent === content) {
-                    this.addMessageToChat('assistant', `⚠️ No changes needed for block "${blockIdentifier}" in ${filePath}`);
-                    return;
-                }
-                newContent = updatedContent;
-                edited = true;
-            }
-
-            if (edited) {
-                // Write updated content
-                await fs.promises.writeFile(fullPath, newContent);
-                
-                // Show success message
-                this.addMessageToChat('assistant', `✅ Updated ${blockIdentifier} in ${filePath}`);
-
-                // Open the file in editor
-                const document = await vscode.workspace.openTextDocument(fullPath);
-                await vscode.window.showTextDocument(document);
-            }
-        } catch (error) {
-            throw new Error(`Failed to edit file ${filePath}: ${error instanceof Error ? error.message : 'Unknown error'}`);
-        }
-    }
-
-    private async processFileCreationMarkers(text: string) {
-        const fileRegex = /###\s*([^\n]+)\s*\n([\s\S]*?)%%%/g;
-        let match;
-
-        while ((match = fileRegex.exec(text)) !== null) {
-            const [_, filePath, content] = match;
-            // Clean up the content by removing markdown code block markers
-            const cleanContent = content
-                .trim()
-                .replace(/^```[\w-]*\n/gm, '') // Remove opening code block markers
-                .replace(/```$/gm, '')         // Remove closing code block markers
-                .replace(/^`{1,2}[\w-]*\n/gm, '') // Remove inline code markers
-                .replace(/`{1,2}$/gm, '')         // Remove closing inline code markers
-                .trim();
-            
-            await this.createFile(filePath.trim(), cleanContent);
-        }
-    }
 }
 
 class FileViewProvider implements vscode.WebviewViewProvider {
@@ -1388,12 +1570,13 @@ class FileViewProvider implements vscode.WebviewViewProvider {
 
         webviewView.webview.options = {
             enableScripts: true,
-            localResourceRoots: [
-                this._extensionUri
-            ]
+            enableCommandUris: false,
+            localResourceRoots: [this._extensionUri]
         };
 
-        webviewView.webview.html = this._getHtmlForWebview();
+        // Set strict Content-Security-Policy
+        const nonce = getNonce();
+        webviewView.webview.html = this._getHtmlForWebview(nonce);
         
         // Initial file list update
         this.updateFileList();
@@ -1569,13 +1752,14 @@ class FileViewProvider implements vscode.WebviewViewProvider {
         return tree;
     }
 
-    private _getHtmlForWebview() {
+    private _getHtmlForWebview(nonce: string) {
         return `
             <!DOCTYPE html>
             <html lang="en">
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}' 'unsafe-eval'; img-src https: data:; connect-src https:; font-src https:;">
                 <title>Project Files</title>
                 <style>
                     :root {
@@ -1752,7 +1936,7 @@ class FileViewProvider implements vscode.WebviewViewProvider {
             </head>
             <body>
                 <div id="file-tree" class="file-tree"></div>
-                <script>
+                <script nonce="${nonce}">
                     const vscode = acquireVsCodeApi();
                     const fileTree = document.getElementById('file-tree');
 
@@ -2011,4 +2195,14 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(...disposables);
 }
 
-export function deactivate() {} 
+export function deactivate() {}
+
+// Add nonce generation function
+function getNonce() {
+    let text = '';
+    const possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    for (let i = 0; i < 32; i++) {
+        text += possible.charAt(Math.floor(Math.random() * possible.length));
+    }
+    return text;
+} 

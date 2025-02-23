@@ -1,0 +1,13 @@
+{
+    "falalo.openaiApiKey": "YOUR_API_KEY_HERE",
+    "falalo.maxContextFiles": 500,
+    "falalo.contextInclusions": [
+        "**/*.{js,ts,jsx,tsx,py,java,cpp,c,go,rs}"
+    ],
+    "falalo.contextExclusions": [
+        "**/node_modules/**",
+        "**/.git/**",
+        "**/dist/**",
+        "**/build/**"
+    ]
+} 

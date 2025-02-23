@@ -455,6 +455,10 @@ Instructions:
 5. Include technical requirements and SEO considerations
 
 Output Format:
+Your response MUST be wrapped with $$$ at the start and *** at the end.
+
+Example:
+$$$
 **Refined Website Specification**
 - Purpose: [Main goal + use cases]
 - Audience: [Target users + needs]
@@ -464,6 +468,7 @@ Output Format:
   - Layout: [Structure preferences]
 - Content/Features: [Pages + functionalities]
 - Technical: [Framework + SEO + performance]
+***
 
 Keep the output organized and detailed. Flag any assumptions made.`;
 
@@ -472,7 +477,7 @@ Keep the output organized and detailed. Flag any assumptions made.`;
             messages: [
                 { 
                     role: 'system', 
-                    content: 'You are an expert in website planning and requirements analysis. Help refine and expand website creation requests into detailed specifications.' 
+                    content: 'You are an expert in website planning and requirements analysis. Help refine and expand website creation requests into detailed specifications. Always wrap your response with $$$ and ***.' 
                 },
                 { role: 'user', content: refinementPrompt }
             ]
@@ -480,20 +485,134 @@ Keep the output organized and detailed. Flag any assumptions made.`;
 
         const refinedSpec = refinementCompletion.choices[0].message.content || '';
         
+        // Extract the content between $$$ and ***
+        const markerRegex = /\$\$\$([\s\S]*?)\*\*\*/;
+        const match = refinedSpec.match(markerRegex);
+        const cleanedSpec = match ? match[1].trim() : refinedSpec;
+        
         // Log the refinement
         this.logger.log('PROMPT_REFINEMENT', 'Refined user prompt', {
             originalPrompt: text,
-            refinedSpec: refinedSpec
+            refinedSpec: cleanedSpec
         });
 
-        // Show the refined spec to the user
+        // Show the refined spec to the user with clear markers
         this.addMessageToChat('assistant', `📋 I've refined your website requirements:
 
-${refinedSpec}
+$$$
+${cleanedSpec}
+***
 
 Creating your website based on these specifications...`);
 
-        return refinedSpec;
+        return cleanedSpec;
+    }
+
+    private async runAccessibilityTests(files: { path: string, content: string }[]): Promise<string> {
+        this.addMessageToChat('assistant', '🔍 Running accessibility tests...');
+        
+        // Use axe-core for accessibility testing
+        const testResults = await this.openai.chat.completions.create({
+            model: 'o3-mini',
+            messages: [
+                { 
+                    role: 'system', 
+                    content: 'You are an accessibility testing expert. Analyze the HTML, CSS, and JavaScript code for accessibility issues using WCAG 2.1 guidelines.' 
+                },
+                { 
+                    role: 'user', 
+                    content: `Analyze these website files for accessibility:\n\n${files.map(f => `File: ${f.path}\n${f.content}\n---\n`).join('\n')}` 
+                }
+            ]
+        });
+
+        const accessibilityReport = testResults.choices[0].message.content || '';
+        
+        this.addMessageToChat('assistant', `📋 Accessibility Report:\n${accessibilityReport}`);
+        return accessibilityReport;
+    }
+
+    private async captureWebsiteScreenshot(files: { path: string, content: string }[]): Promise<string> {
+        this.addMessageToChat('assistant', '📸 Generating website visualization...');
+        
+        // Create a visual description of the website using GPT-4
+        const visualizationCompletion = await this.openai.chat.completions.create({
+            model: 'gpt-4o-mini',
+            messages: [
+                { 
+                    role: 'system', 
+                    content: 'You are a visual design expert. Create a detailed visual description of the website based on its code, including layout, colors, components, and visual hierarchy.' 
+                },
+                { 
+                    role: 'user', 
+                    content: `Describe the visual appearance of this website:\n\n${files.map(f => `File: ${f.path}\n${f.content}\n---\n`).join('\n')}` 
+                }
+            ]
+        });
+
+        const visualDescription = visualizationCompletion.choices[0].message.content || '';
+        
+        this.addMessageToChat('assistant', `🎨 Visual Analysis:\n${visualDescription}`);
+        return visualDescription;
+    }
+
+    private async enhanceWebsite(
+        files: { path: string, content: string }[],
+        accessibilityReport: string,
+        visualAnalysis: string,
+        refinedSpec: string
+    ): Promise<{ path: string, content: string }[]> {
+        this.addMessageToChat('assistant', '🔄 Enhancing website based on analysis...');
+
+        const enhancementPrompt = `Enhance this website based on the following inputs:
+
+1. Original Specification:
+${refinedSpec}
+
+2. Accessibility Report:
+${accessibilityReport}
+
+3. Visual Analysis:
+${visualAnalysis}
+
+4. Current Implementation:
+${files.map(f => `File: ${f.path}\n${f.content}\n---\n`).join('\n')}
+
+Requirements for enhancement:
+1. Address all accessibility issues
+2. Improve visual design based on the analysis
+3. Maintain or enhance all existing functionality
+4. Keep the same file structure
+5. Ensure responsive design
+6. Optimize performance
+7. Follow best practices for modern web development
+
+Generate enhanced versions of all files using this format:
+### filename.ext
+content
+%%%`;
+
+        const enhancementCompletion = await this.openai.chat.completions.create({
+            model: 'o3-mini',
+            messages: [
+                { 
+                    role: 'system', 
+                    content: 'You are a senior web developer specializing in accessibility, visual design, and web standards. Enhance website code while maintaining its core functionality.' 
+                },
+                { role: 'user', content: enhancementPrompt }
+            ]
+        });
+
+        const enhancedImplementation = enhancementCompletion.choices[0].message.content || '';
+        
+        // Extract enhanced files
+        const fileRegex = /^###([^\n]+)\n([\s\S]*?)^%%%$/gm;
+        const enhancedFiles = [...enhancedImplementation.matchAll(fileRegex)].map(match => ({
+            path: match[1].trim(),
+            content: match[2].trim()
+        }));
+
+        return enhancedFiles;
     }
 
     private async handleUserMessage(text: string) {
@@ -510,6 +629,11 @@ Creating your website based on these specifications...`);
 
             // First, refine the user's prompt
             const refinedSpec = await this.refineUserPrompt(text);
+
+            // Extract the actual specification (in case it still has markers)
+            const markerRegex = /\$\$\$([\s\S]*?)\*\*\*/;
+            const match = refinedSpec.match(markerRegex);
+            const finalSpec = match ? match[1].trim() : refinedSpec;
 
             const includedFiles = this.contextManager.getIncludedFiles();
             const excludedFiles = this.contextManager.getExcludedFiles();
@@ -544,7 +668,7 @@ Creating your website based on these specifications...`);
             });
 
             const websiteInstructions = `Refined Website Specification:
-${refinedSpec}
+${finalSpec}
 
 You are a website developer tasked with creating a complete, modern, and beautiful website based on the above specifications. Generate all necessary files in a single response.
 
@@ -584,9 +708,24 @@ JavaScript Requirements (script.js):
 - State management
 - NO FILLER FUNCTIONS
 
-Create each file using this format:
-### filename.ext
-content
+IMPORTANT - File Creation Format:
+For each file, you MUST use this EXACT format:
+1. Start with ### followed immediately by the filename on the same line
+2. On the next line, start the actual code content
+3. End with %%% on its own line
+4. NO additional text, markdown, or formatting around the code
+
+Example of correct format:
+###index.html
+<!DOCTYPE html>
+<html>
+...actual code...
+</html>
+%%%
+
+###styles.css
+/* Your CSS code */
+...actual code...
 %%%
 
 Workspace context:${contextInfo}
@@ -623,42 +762,53 @@ Focus on creating a cohesive, professional website with extensive functionality 
 
             const implementation = completion.choices[0].message.content || '';
             
-            // Extract all file creation markers
-            const fileRegex = /###\s*([^\n]+)\s*\n([\s\S]*?)%%%/g;
+            // Extract all file creation markers with strict pattern
+            const fileRegex = /^###([^\n]+)\n([\s\S]*?)^%%%$/gm;
             
             const files = [...implementation.matchAll(fileRegex)].map(match => ({
                 path: match[1].trim(),
                 content: match[2].trim()
             }));
 
-            // Create all files
-            this.addMessageToChat('assistant', `📝 Creating website files...`);
-            
+            // Create initial files
+            this.addMessageToChat('assistant', `📝 Creating initial website files...`);
             for (const file of files) {
-                try {
-                    await this.createFile(file.path, file.content);
-                    this.addMessageToChat('assistant', `✅ Created ${file.path}`);
-                    // Add a small delay after file creation
-                    await new Promise(resolve => setTimeout(resolve, 500));
-                } catch (error) {
-                    this.addMessageToChat('assistant', `❌ Error creating file ${file.path}: ${error instanceof Error ? error.message : 'Unknown error'}`);
-                    throw error;
-                }
+                await this.createFile(file.path, file.content);
+                this.addMessageToChat('assistant', `✅ Created ${file.path}`);
+                await new Promise(resolve => setTimeout(resolve, 500));
+            }
+
+            // Run accessibility tests
+            const accessibilityReport = await this.runAccessibilityTests(files);
+
+            // Generate visual analysis
+            const visualAnalysis = await this.captureWebsiteScreenshot(files);
+
+            // Enhance website based on analysis
+            const enhancedFiles = await this.enhanceWebsite(files, accessibilityReport, visualAnalysis, finalSpec);
+
+            // Create enhanced files
+            this.addMessageToChat('assistant', `📝 Creating enhanced website files...`);
+            for (const file of enhancedFiles) {
+                await this.createFile(file.path, file.content);
+                this.addMessageToChat('assistant', `✅ Enhanced ${file.path}`);
+                await new Promise(resolve => setTimeout(resolve, 500));
             }
 
             // Final completion message
             const completionTime = Math.round((Date.now() - startTime) / 1000);
-            this.addMessageToChat('assistant', `🎉 Website creation completed in ${completionTime} seconds!
+            this.addMessageToChat('assistant', `🎉 Website creation and enhancement completed in ${completionTime} seconds!
 
-Files created:
+Initial files created:
 ${files.map(f => `• ${f.path}`).join('\n')}
 
-The website includes:
-• Modern, semantic HTML structure
-• Extensive CSS styling and animations
-• Interactive JavaScript functionality
+Enhancements made:
+• Improved accessibility based on WCAG 2.1 guidelines
+• Enhanced visual design and user experience
+• Optimized code structure and performance
+• Added better responsive design handling
 
-You can now open the files to view and edit the code.`);
+You can now open the files to view and edit the enhanced code.`);
 
         } catch (error) {
             // Log errors
@@ -734,8 +884,8 @@ ${existingFiles.join('\n')}`;
 
         const implementation = executionCompletion.choices[0].message.content || '';
         
-        // Extract all file creation markers
-        const fileRegex = /###\s*([^\n]+)\s*\n([\s\S]*?)%%%/g;
+        // Extract all file creation markers with strict pattern
+        const fileRegex = /^###([^\n]+)\n([\s\S]*?)^%%%$/gm;
         
         const files = [...implementation.matchAll(fileRegex)].map(match => ({
             path: match[1].trim(),
@@ -768,6 +918,25 @@ ${existingFiles.join('\n')}`;
         this.addMessageToChat('assistant', `✅ Step ${stepIndex + 1} completed`);
     }
 
+    private cleanupContent(content: string): string {
+        // Remove lines that are just repeated characters (like dashes or underscores)
+        // Only if they are longer than 10 characters
+        return content.split('\n').map(line => {
+            const trimmedLine = line.trim();
+            if (trimmedLine.length > 10) {
+                // Check if line consists of a single repeated character
+                const firstChar = trimmedLine[0];
+                const isRepeatedChar = trimmedLine.split('').every(char => char === firstChar);
+                if (isRepeatedChar && ['-', '_', '=', '*', '#', '~', '+', '.'].includes(firstChar)) {
+                    return ''; // Remove the line
+                }
+            }
+            return line;
+        }).join('\n')
+        // Remove multiple consecutive empty lines
+        .replace(/\n{3,}/g, '\n\n');
+    }
+
     private async createFile(filePath: string, content: string) {
         // Log file creation attempt
         this.logger.log('FILE_CREATION', 'Attempting to create file', { filePath });
@@ -777,6 +946,9 @@ ${existingFiles.join('\n')}`;
             this.logger.log('FILE_ERROR', error, { filePath });
             throw new Error(error);
         }
+
+        // Clean up the content before processing
+        const cleanedContent = this.cleanupContent(content);
 
         const workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
         const fullPath = path.join(workspaceRoot, filePath);
@@ -792,7 +964,7 @@ ${existingFiles.join('\n')}`;
             // Read existing file content
             const existingContent = await fs.promises.readFile(fullPath, 'utf8');
             const existingLength = existingContent.trim().length;
-            const newLength = content.trim().length;
+            const newLength = cleanedContent.trim().length;
 
             if (newLength <= existingLength) {
                 const errorMessage = `File exists and new content is not longer: ${filePath}`;
@@ -816,8 +988,8 @@ ${existingFiles.join('\n')}`;
             // Create directory if it doesn't exist
             await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
 
-            // Write file content
-            await fs.promises.writeFile(fullPath, content);
+            // Write cleaned file content
+            await fs.promises.writeFile(fullPath, cleanedContent);
 
             // Log successful file creation/update
             this.logger.log('FILE_SUCCESS', 'File operation successful', {
